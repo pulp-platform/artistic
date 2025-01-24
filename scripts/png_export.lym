@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="utf-8"?>
+<klayout-macro>
+ <description/>
+ <version/>
+ <category/>
+ <prolog/>
+ <epilog/>
+ <doc/>
+ <autorun>false</autorun>
+ <autorun-early>false</autorun-early>
+ <priority>0</priority>
+ <shortcut/>
+ <show-in-menu>false</show-in-menu>
+ <group-name/>
+ <menu-path/>
+ <interpreter>ruby</interpreter>
+ <dsl-interpreter-name/>
+ <text>module PngExport
+
+  # Copyright 2025 ETH Zurich and University of Bologna.
+  # Licensed under the Apache License, Version 2.0, see LICENSE for details.
+  # SPDX-License-Identifier: Apache-2.0
+  #
+  # Thomas Benz tbenz@iis.ee.ethz.ch
+  # Paul Scheffler paulsc@iis.ee.ethz.ch
+  # Nils Wistoff nwistoff@iis.ee.ethz.ch
+  # Philippe Sauter phsauter@iis.ee.ethz.ch
+ 
+  require "json"
+  include RBA
+
+  # read config
+  file = File.open "chip.json"
+  data = JSON.load file
+
+  chip_name = data["general"]["chip"]
+  out_path = data["work"]["dir"]
+
+  # in um
+  dbu = data["tech"]["db_unit_nm"] / 1000.0
+  num_db_digids = -Math.log10(dbu).ceil()
+  
+  # in dbus
+  gds_x_offset = (data["gds"]["x_offset_um"] / dbu).round(0)
+  gds_y_offset = (data["gds"]["y_offset_um"] / dbu).round(0)
+  gds_width = (data["gds"]["width_um"] / dbu).round(0)
+  gds_height = (data["gds"]["height_um"] / dbu).round(0)
+
+  image_width_req = data["image"]["px_width"] * data["image"]["overrender_factor"]
+  image_height_req = data["image"]["px_height"] * data["image"]["overrender_factor"]
+
+  # we might need to tile
+  num_tiles_required = 1.0 * image_width_req * image_height_req / data["tech"]["max_px_tile"]
+
+  # calculate tiling, if any
+  if num_tiles_required > 1 then
+    zoom_factor = (Math.sqrt(num_tiles_required)).ceil
+    zoom_factor_x = 1.0 * zoom_factor.lcm(data["image"]["num_segs_width"])
+    zoom_factor_y = 1.0 * zoom_factor.lcm(data["image"]["num_segs_height"])
+    image_width = (image_width_req / zoom_factor_x).ceil * zoom_factor_x
+    image_height = (image_height_req / zoom_factor_y).ceil * zoom_factor_y
+  else
+    zoom_factor_x = data["image"]["num_segs_width"]
+    zoom_factor_y = data["image"]["num_segs_height"]
+    image_width = image_width_req * 1.0
+    image_height = image_height_req * 1.0
+  end
+
+  # calculate resolution dbu/px
+  dbu_p_px_x = gds_width / image_width
+  dbu_p_px_y = gds_height / image_height
+  dbu_p_px = [dbu_p_px_x, dbu_p_px_y].max
+
+  # scale gds are to image size
+  tot_gds_width = image_width * dbu_p_px
+  tot_gds_height = image_height * dbu_p_px
+
+  # make divisible by zoom factor
+  tot_gds_width = ((tot_gds_width / zoom_factor_x).ceil * zoom_factor_x).ceil
+  tot_gds_height = ((tot_gds_height / zoom_factor_y).ceil * zoom_factor_y).ceil
+
+  # extra padding
+  extra_pad_x = ((tot_gds_width - gds_width) / 2.0).ceil
+  extra_pad_y = ((tot_gds_height - gds_height) / 2.0).ceil
+
+  # calculate offsets
+  tot_gds_x_offset = gds_x_offset - extra_pad_x
+  tot_gds_y_offset = gds_y_offset - extra_pad_y
+
+  block_height = tot_gds_width / zoom_factor_x
+  block_width = tot_gds_height / zoom_factor_y
+
+
+  # print info
+  puts "Image resolution: #{image_width.ceil}px x #{image_height.ceil}"
+  puts "Number of tiles:  #{zoom_factor_x.ceil} x #{zoom_factor_y.ceil}"
+  puts "Tile Size:        #{(image_width / zoom_factor_x).ceil}px x #{(image_height / zoom_factor_y).ceil}px"
+  puts ""
+  puts "GDS size:         #{tot_gds_width} dbu x #{tot_gds_height} dbu"
+  puts "GDS tile size:    #{block_width} dbu x #{block_height} dbu"
+  puts "GDS offsets:      x: #{tot_gds_x_offset} dbu y:#{tot_gds_y_offset} dbu"
+  puts ""
+  puts "resolution x:     #{dbu_p_px_x} dbu/px, #{dbu_p_px_x * dbu * 1000} nm/px"
+  puts "resolution y:     #{dbu_p_px_y} dbu/px, #{dbu_p_px_y * dbu * 1000} nm/px"
+  puts ""
+  puts "------"
+  puts ""
+
+  # only render if armed
+  if !data["tech"]["dry_run"] then
+
+    # fetch layout
+    layout = Layout::new
+    layout.read(data["gds"]["file"])
+
+    layout_view = LayoutView::new
+    layout_view.set_config("ruler-color", "#FFFFFF")
+    layout_view.set_config("background-color", "#FFFFFF")
+    layout_view.set_config("grid-visible", "false")
+    layout_view.set_config("images-visible", "false")
+    layout_view.set_config("text-color", "#FFFFFF")
+    layout_view.set_config("text-visible", "false")
+    layout_view.set_config("show-bookmarks-view", "false")
+    layout_view.set_config("show-hierarchy-panel", "false")
+    layout_view.set_config("show-layer-panel", "false")
+    layout_view.set_config("show-layer-toolbox", "false")
+    layout_view.set_config("show-libraries-view", "false")
+    layout_view.set_config("show-navigator", "false")
+    layout_view.set_config("show-properties", "false")
+    layout_view.set_config("show-toolbar", "false")
+    layout_view.show_layout(layout, 0)
+    layout_view.load_layer_props("#{chip_name}.lyp")
+    #puts layout_view.get_config_names
+
+    view = layout_view.active_cellview
+    layout_view.max_hier()
+
+    # get the active layers
+    layers = []
+    li = layout_view.begin_layers
+    while !li.at_end?
+      if li.current.visible? &amp;&amp; !li.current.has_children? &amp;&amp; li.current.layer_index &gt;= 0
+        layers &lt;&lt; li.current
+        li.current.visible=false
+      end
+      li.next
+    end
+
+    # export each layer
+    layers.each do |lp|
+      # make current layer visible
+      lp.visible=true
+      layer_id = lp.flat.source
+      layer_id = layer_id.chop.chop
+      layer_id = layer_id.sub("/", ".")
+      layer_name = lp.flat.name
+
+      # export the layer
+      for x in 0..zoom_factor_x-1 do
+        for y in 0..zoom_factor_y-1 do
+          left = tot_gds_x_offset + x * block_height
+          bottom = tot_gds_y_offset + y * block_width
+          right = tot_gds_x_offset + (x+1) * block_height
+          top = tot_gds_y_offset + (y+1) * block_width
+          puts "Working on block: #{layer_id} (#{layer_name})- x:#{x} y:#{y} -&gt; (#{left} #{bottom} #{right} #{top})"
+          current_box = DBox::new(left * dbu, bottom * dbu, right * dbu, top * dbu)
+          layout_view.zoom_box(current_box)
+          layout_view.save_image("#{out_path}/RAW__#{chip_name}_#{layer_id}.#{layer_name}_#{y}-#{x}.png", (image_width / zoom_factor_x).ceil, (image_height / zoom_factor_y).ceil)
+        end
+      end
+
+      # turn visibility off
+      lp.visible=false
+    end
+
+    # restore visibilty
+    layers.each do |lp|
+      lp.visible=true
+    end
+  end
+end
+</text>
+</klayout-macro>
