@@ -48,7 +48,7 @@ $(WORKDIR)/COL__%.png: $(WORKDIR)/RAW__%.png $(CFG_FILE)
 	    $@
 
 # merge tiles
-$(WORKDIR)/MRG__%.png: $$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) COL $$<)
+$(WORKDIR)/MRG__%.png: $$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) COL $$@)
 	convert $(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) CMP $<)  \
 	    -background black \
 	    -alpha remove \
@@ -63,7 +63,7 @@ $(WORKDIR)/RSZ__%.png: $(WORKDIR)/MRG__%.png $(CFG_FILE)
 		$@
 
 # merge tiles
-$(WORKDIR)/SEG__%.png: $$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) SEGSRC $$<)
+$(WORKDIR)/SEG__%.png: $$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) SEGSRC $$@)
 	$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) SEGGEN $@)
 
 # change dpi
