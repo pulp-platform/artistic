@@ -79,7 +79,7 @@ def gen_tile_list(data: dict) -> list:
     # generate list
     for w in range(info['tiles_w']):
         for h in range(info['tiles_h']):
-            res.append(f'{work}/MRG__{chip}_{w}-{h}.png')
+            res.append(f'{work}/MRG__{chip}_{h}-{w}.png')
 
     return res
 
