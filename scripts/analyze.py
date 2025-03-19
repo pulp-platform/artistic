@@ -38,11 +38,15 @@ def analyze(data: dict) -> dict:
     res = {}
 
     # tile calculation
-    num_tiles = data['image']['px_width'] * data['image']['px_height'] * \
-        data['image']['overrender_factor']**2 / data["tech"]["max_px_tile"]
-    tiles = math.ceil(math.sqrt(num_tiles))
-    res['tiles_w'] = math.lcm(tiles, data['image']['num_segs_width'])
-    res['tiles_h'] = math.lcm(tiles, data['image']['num_segs_height'])
+    if data["tech"]["max_px_tile"] == "-":
+        res['tiles_w'] = data["image"]["num_tiles_width"]
+        res['tiles_h'] = data["image"]["num_tiles_height"]
+    else:
+        num_tiles = data['image']['px_width'] * data['image']['px_height'] * \
+            data['image']['overrender_factor']**2 / data["tech"]["max_px_tile"]
+        tiles = math.ceil(math.sqrt(num_tiles))
+        res['tiles_w'] = math.lcm(tiles, data['image']['num_segs_width'])
+        res['tiles_h'] = math.lcm(tiles, data['image']['num_segs_height'])
 
     # image calc
     res['image_w'] = math.ceil(data['image']['px_width'] / res['tiles_w']) * res['tiles_w']

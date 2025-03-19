@@ -37,6 +37,7 @@ all : gen_raw gen_pdfs
 $(WORKDIR)/COL__%.png: $(WORKDIR)/RAW__%.png $(CFG_FILE)
 	convert \
 	    $< \
+	    -limit thread 1 \
 	    -negate \
 	    -background $(shell $(PYTHON) $(SCRIPTS)/fetch_color.py $(CFG_FILE) $< color) \
 	    -alpha shape \
@@ -50,6 +51,7 @@ $(WORKDIR)/COL__%.png: $(WORKDIR)/RAW__%.png $(CFG_FILE)
 # merge tiles
 $(WORKDIR)/MRG__%.png: $$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) COL $$@)
 	convert $(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) CMP $<)  \
+		-limit thread 1 \
 	    -background black \
 	    -alpha remove \
 	    -alpha off \
@@ -100,7 +102,10 @@ gen_raw: $(CFG_FILE) $(SCRIPTS)/gen_layer_props.py $(SCRIPTS)/png_export.lym
 	cd $(WORKDIR); $(KLAYOUT) -zz -rm $(ROOT_DIR)/$(SCRIPTS)/png_export.lym
 
 .PHONY: gen_tiles
-gen_tiles: $$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) RSZ "")
+gen_tiles: $$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) MRG "")
+
+.PHONY: gen_resized_tiles
+gen_resized_tiles: $$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) RSZ "")
 
 .PHONY: gen_segs
 gen_segs: $$(shell $(PYTHON) $(SCRIPTS)/list_files.py $(CFG_FILE) SEG "")

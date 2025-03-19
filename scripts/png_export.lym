@@ -49,14 +49,21 @@
   image_width_req = data["image"]["px_width"] * data["image"]["overrender_factor"]
   image_height_req = data["image"]["px_height"] * data["image"]["overrender_factor"]
 
-  # we might need to tile
-  num_tiles_required = 1.0 * image_width_req * image_height_req / data["tech"]["max_px_tile"]
+  # we might need to tile; get the number of tiles
+  if data["tech"]["max_px_tile"] == "-"
+    num_tiles_required = 1.0 * data["image"]["num_tiles_width"] * data["image"]["num_tiles_height"]
+    zoom_factor_tx = data["image"]["num_tiles_width"]
+    zoom_factor_ty = data["image"]["num_tiles_height"]
+  else
+    num_tiles_required = 1.0 * image_width_req * image_height_req / data["tech"]["max_px_tile"]
+    zoom_factor_tx = (Math.sqrt(num_tiles_required)).ceil
+    zoom_factor_ty = (Math.sqrt(num_tiles_required)).ceil
+  end
 
   # calculate tiling, if any
   if num_tiles_required > 1 then
-    zoom_factor = (Math.sqrt(num_tiles_required)).ceil
-    zoom_factor_x = 1.0 * zoom_factor.lcm(data["image"]["num_segs_width"])
-    zoom_factor_y = 1.0 * zoom_factor.lcm(data["image"]["num_segs_height"])
+    zoom_factor_x = 1.0 * zoom_factor_tx.lcm(data["image"]["num_segs_width"])
+    zoom_factor_y = 1.0 * zoom_factor_ty.lcm(data["image"]["num_segs_height"])
     image_width = (image_width_req / zoom_factor_x).ceil * zoom_factor_x
     image_height = (image_height_req / zoom_factor_y).ceil * zoom_factor_y
   else
@@ -164,7 +171,9 @@
           top = tot_gds_y_offset + (y+1) * block_width
           puts "Working on block: #{layer_id} (#{layer_name})- x:#{x} y:#{y} -&gt; (#{left} #{bottom} #{right} #{top})"
           current_box = DBox::new(left * dbu, bottom * dbu, right * dbu, top * dbu)
+          puts " Select View"
           layout_view.zoom_box(current_box)
+          puts " Save View"
           layout_view.save_image("#{out_path}/RAW__#{chip_name}_#{layer_id}.#{layer_name}_#{y}-#{x}.png", (image_width / zoom_factor_x).ceil, (image_height / zoom_factor_y).ceil)
         end
       end
