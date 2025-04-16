@@ -170,10 +170,14 @@ def create_logo(margins: list, img_file: str, contrast: float, metal_gds_file: s
     # fail here if the logo is not sized properly
     if img_width != canvas_width or img_height != canvas_height:
         print(f'Logo does not fit: {img_width}x{img_height} in {canvas_width}x{canvas_height}')
-        pad_l = int((canvas_width - img_width) / 2)
-        pad_r = int((canvas_width - img_width) / 2)
-        pad_b = int((canvas_height - img_height) / 2)
-        pad_t = int((canvas_height - img_height) / 2)
+        pad_b = int(margins[0] / DB2NM) + int((canvas_height - img_height) / 2)
+        pad_l = int(margins[1] / DB2NM) + int((canvas_width - img_width) / 2)
+        pad_t = int(margins[2] / DB2NM) + int((canvas_height - img_height) / 2)
+        pad_r = int(margins[3] / DB2NM) + int((canvas_width - img_width) / 2)
+        if (canvas_height - img_height) > 0:
+            pad_b = pad_b + 1
+        if (canvas_width - img_width) > 0:
+            pad_l = pad_b + 1
         print(f'To center the logo: use -m {pad_b},{pad_l},{pad_t},{pad_r}')
         sys.exit(1)
 
