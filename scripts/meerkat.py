@@ -209,7 +209,9 @@ def create_logo(margins: list, img_file: str, contrast: float, metal_gds_file: s
                             translation=(margins[1], margins[0] + img_height*PIXSZ))
 
     logo = gdspy.Cell(name=logo_name)
-    logo.add(gdspy.boolean(shifted, mask, operation='not',
+    # Add offset for not violate DRC TM2.b
+    offset = gdspy.offset(shifted, 2.0, join_first=True)
+    logo.add(gdspy.boolean(offset, mask, operation='not',
                            layer=logo_layer, datatype=logo_datatype))
 
     # cleanup
