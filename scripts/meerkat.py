@@ -160,26 +160,18 @@ def create_logo(margins: list, img_file: str, contrast: float, metal_gds_file: s
     chip_lib = gdspy.GdsLibrary(name='chip', infile=metal_gds_file, unit=1e-9,
                                 precision=1e-9, units='convert')
 
-    # determine the canvas height available to the logo
+    # determine the chip height available to the logo
     bbox_chip = chip_lib.top_level()[0].get_bounding_box()
-    bbox = [bbox_chip[0][0] + margins[0], bbox_chip[0][1] + margins[1],
-            bbox_chip[1][0] - margins[2], bbox_chip[1][1] - margins[3]]
+    chip_height = int((bbox_chip[1][1] - bbox_chip[0][1]) // PIXSZ)
+    chip_width = int((bbox_chip[1][0] - bbox_chip[0][0]) // PIXSZ)
 
-    canvas_height, canvas_width = int((bbox[2] - bbox[0])//PIXSZ), int((bbox[3] - bbox[1])//PIXSZ)
-
-    # fail here if the logo is not sized properly
-    if img_width != canvas_width or img_height != canvas_height:
-        print(f'Logo does not fit: {img_width}x{img_height} in {canvas_width}x{canvas_height}')
-        pad_b = int(margins[0] / DB2NM) + int((canvas_height - img_height) / 2)
-        pad_l = int(margins[1] / DB2NM) + int((canvas_width - img_width) / 2)
-        pad_t = int(margins[2] / DB2NM) + int((canvas_height - img_height) / 2)
-        pad_r = int(margins[3] / DB2NM) + int((canvas_width - img_width) / 2)
-        if (canvas_height - img_height) > 0:
-            pad_b = pad_b + 1
-        if (canvas_width - img_width) > 0:
-            pad_l = pad_b + 1
-        print(f'To center the logo: use -m {pad_b},{pad_l},{pad_t},{pad_r}')
-        sys.exit(1)
+    # center logo or add user-selected margins in pixels!
+    if margin_list:
+        offset_height = margin_list[1]
+        offset_width = margin_list[0]
+    else:
+        offset_height = (chip_height - img_height) // 2
+        offset_width = (chip_width - img_width) // 2
 
     # create the mask for the existing metalization, use one pixel size spacing
     mask = gdspy.Cell(name='mask')
@@ -206,7 +198,7 @@ def create_logo(margins: list, img_file: str, contrast: float, metal_gds_file: s
 
     # shift logo and do the boolean subtraction of the mask
     shifted = pre_logo.copy(name='shifted', deep_copy=False,
-                            translation=(margins[1], margins[0] + img_height*PIXSZ))
+                            translation=(offset_width * PIXSZ, (offset_height + img_height) * PIXSZ))
 
     logo = gdspy.Cell(name=logo_name)
     logo.add(gdspy.boolean(shifted, mask, operation='not',
@@ -231,7 +223,7 @@ def create_logo(margins: list, img_file: str, contrast: float, metal_gds_file: s
     # calculate metal layer density
     polygons = clean_logo.get_polygons()
     total_metal_area = sum(gdspy.Polygon(polygon).area() for polygon in polygons)
-    density = total_metal_area / (bbox[2] - bbox[0]) / (bbox[3] - bbox[1]) * 100.0
+    density = total_metal_area / (chip_height * PIXSZ) / (chip_width * PIXSZ) * 100.0
     print(f'Logo density: {density}')
 
     # write to file
@@ -251,8 +243,8 @@ if __name__ == '__main__':
                         prog='Meerkat',
                         description='Translate an image of the proper dimensions to a GDS')
 
-    parser.add_argument('-m', '--margins', required=True,
-                        help='Margins in nm: bottom,left,top,right', type=str)
+    parser.add_argument('-m', '--margins', required=False,
+                        help='Margins in um: left,bottom', type=str)
 
     parser.add_argument('-i', '--image_file', required=True,
                         help='The image file to use', type=str)
@@ -280,7 +272,10 @@ if __name__ == '__main__':
 
     # get the args and process them
     args = parser.parse_args()
-    margin_list = [DB2NM * float(item) for item in args.margins.split(',')]
+    if args.margins:
+        margin_list = [1000.0 / PIXSZ * float(item) for item in args.margins.split(',')]
+    else:
+        margin_list = None
 
     # create the logo
     create_logo(margin_list, args.image_file, args.contrast, args.metal_gds, args.logo_layer,
