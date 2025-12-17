@@ -101,9 +101,11 @@ def parse_lef_files(lef_file_paths: list) -> dict:
         lef_files.extend(glob.glob(lfp))
 
     for lef_file in lef_files:
+        print(f'Found {lef_file}')
         with open(lef_file) as f:
             cells = re.findall(LEF_SIZE_REGEX, f.read(), re.DOTALL)
             for cell in cells:
+                print(f' - {cell[0]}')
                 lef_cells[cell[0]] = (float(cell[1]), float(cell[2]))
 
     return lef_cells
@@ -387,7 +389,9 @@ Merged SVG output
     os.makedirs(dest_dir, exist_ok=True)
 
     # copy background
-    shutil.copy(background, dest_dir)
+    src_dir = os.path.dirname(background)
+    if src_dir != dest_dir:
+        shutil.copy(background, dest_dir)
 
     # write merged svgs
     with open(merged_svg, 'w') as out_file:
