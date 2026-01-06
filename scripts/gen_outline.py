@@ -159,7 +159,7 @@ def parse_def_file_hier(def_file_path: str, scale: int, min_hier: int, max_hier:
 
                             # check whether this is a special cell (with size)
                             if master_cell_name in lef_cells:
-                                if orientation == 'N':
+                                if orientation in ['N', 'S']:
                                     pxs_x = int(lef_cells[master_cell_name][0] * 1000 / scale)
                                     pxs_y = int(lef_cells[master_cell_name][1] * 1000 / scale)
                                 else:
@@ -222,7 +222,7 @@ def parse_def_file_json(def_file_path: str, scale: int, modules: dict, lef_files
 
                         # check whether this is a special cell (with size)
                         if master_cell_name in lef_cells:
-                            if orientation == 'N':
+                            if orientation in ['N', 'S']:
                                 pxs_x = int(lef_cells[master_cell_name][0] * 1000 / scale)
                                 pxs_y = int(lef_cells[master_cell_name][1] * 1000 / scale)
                             else:

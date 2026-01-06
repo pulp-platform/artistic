@@ -10,11 +10,13 @@
         "height_um"   : 2200
     },
     "image": {
-        "px_width"          : 44000,
-        "px_height"         : 44000,
+        "px_width"          : 2200,
+        "px_height"         : 2200,
         "overrender_factor" : 2,
         "num_segs_width"    : 1,
-        "num_segs_height"   : 1
+        "num_segs_height"   : 1,
+        "num_tiles_width"   : 2,
+        "num_tiles_height"  : 2
     },
     "paper": {
         "width_cm"  : 84.1,
@@ -41,7 +43,7 @@
     },
     "tech" : {
         "manifest_version" : 1,
-        "max_px_tile"      : 2500000000,
+        "max_px_tile"      : "-",
         "pdk"              : "ihp13",
         "layer_order"      : [
             "CONT",

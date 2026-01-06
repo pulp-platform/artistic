@@ -4,4 +4,6 @@
 
 ## Example Output
 
-![MLEM Result](mlem_render.jpg)
+![MLEM Result](golden/mlem_render.jpg)
+
+![MLEM Module Result](golden/mlem_render_modules.jpg)

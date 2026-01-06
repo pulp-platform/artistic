@@ -50,7 +50,7 @@ Transform the logo to GDS:
 
 ```
 python3 scripts/meerkat.py \
-    -m "112,112,178,178" \
+    -m 210,210 \
     -i meerkat_work/mlem_logo_mono.png \
     -g meerkat_work/mlem_tm.gds \
     -l 134 \
@@ -110,6 +110,45 @@ The last step can be parallelized using the '-j' option.
 Profit!
 
 
+## Automatic Module Outline Generation
+
+***Module Outline Generation Only Tested for the [IHP 130nm Open PDK](https://github.com/IHP-GmbH/IHP-Open-PDK) and OpenROAD***
+
+With the information gathered from the chip's DEF file, ArtistIC can automatically annotate module
+outlines on top of renders.
+
+For the provided example, fetch `v0.1.0` of IHP's open PDK in the `pdk` directory:
+
+```
+git clone https://github.com/IHP-GmbH/IHP-Open-PDK.git --recursive --branch v0.1.0 pdk
+```
+
+Unzip the DEF file:
+
+```
+gzip -dc examples/mlem/mlem.def.gz > /dev/shm/renderics/mlem.def
+```
+
+A vector image containing the outlines can then be generated using:
+
+```
+python3 scripts/gen_outline.py \
+    -i /dev/shm/renderics/mlem.def \
+    -o /dev/shm/renderics/mlem_modules.svg \
+    -b /dev/shm/renderics/DPI__mlem_0-0.png \
+    --lef_files pdk/ihp-sg13g2/libs.ref/sg13g2_sram/lef/*.lef \
+    --px_scale 15000 \
+    --offset_x 100 \
+    --offset_y 83 \
+    --module_json examples/mlem/mlem_modules.json \
+    --opacity 0.65 \
+    --font_size 35 \
+    --luminosity 0.85
+```
+
+The resulting file is called `/dev/shm/renderics/mlem_modules.svg` and does not contain the bond pads.
+
+
 ## License
 ArtistIC is released under Version 2.0 (Apache-2.0) see [`LICENSE`](LICENSE):
 
@@ -122,6 +161,10 @@ for additional information.
 ## Prerequisites
 
 - [`ImageMagick  >= v6.9.12-93`](https://imagemagick.org/script/download.php)
+- [`Inkscape  >= v1.0.0`](inkscape.org)
+- [`Potrace  >= v1.15`](https://potrace.sourceforge.net/)
 - [`KLayout  >= v0.29.0`](https://www.klayout.de/build.html)
 - [`img2pdf  >= v0.4.4`](https://pypi.org/project/img2pdf)
 - [`gdspy  >= v1.6.13`](https://pypi.org/project/gdspy)
+- [`Pillow  >= v10.0.0`](https://pypi.org/project/pillow)
+- [`svgpathtools  >= v1.7.2`](https://pypi.org/project/svgpathtools)
