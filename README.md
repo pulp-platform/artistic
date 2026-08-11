@@ -1,170 +1,98 @@
-# ArtistIC: An Open-Source Toolchain for Top-Metal IC Art and Ultra-High-Fidelity GDSII Renders
+# ArtistIC
 
-ArtistIC is a framework can be used to
+ArtistIC turns a chip GDS into artwork, layer images, and a zoomable map. A
+project is a TOML file and the Python `Project` class is the implementation of
+the flow. The `bin/artistic` command and the Makefile only select a project and
+call that interface.
 
-* Translate and insert ASIC art on top-metal layers.
-* Render GDSII files at ultra-high fidelity.
+Each product has explicit stages. KLayout stages generate physical data;
+host stages apply colors or assemble image files.
 
-ArtistIC is part of the [PULP (Parallel Ultra-Low-Power) platform](https://pulp-platform.org/),
-where it is used render high-definition posters of our [chips](http://asic.ethz.ch/).
-
-ArtistIC is in a ***experimental*** stage and might produce bad results. We are happy to
-receive your contributions through issues and PRs improving this framework. In a first step, the
-entire process has to be streamlined.
-
-
-## Top-Metal ASIC Artwork Generation (Meerkat)
-
-***Logo Generation Only Tested for the [IHP 130nm Open PDK](https://github.com/IHP-GmbH/IHP-Open-PDK)***
-
-Prepare a temporary work directory:
-
-```
-mkdir -p meerkat_work
+```text
+logo prepare -> logo merge -> render generate -> render compose
+                                  \-> map generate -> map build
 ```
 
+## Quick start
 
-Export the top-metal layer:
+Use the example project from the ArtistIC directory:
 
-```
-python3 scripts/meerkat_interface.py \
-    -i ../examples/mlem/mlem_vanilla.gds.gz \
-    -m mlem_tm.gds.gz \
-    -g mlem_logo.gds \
-    -o mlem_chip.gds.gz \
-    -w meerkat_work \
-    -l 134
-cd meerkat_work; klayout -zz -rm ../scripts/export_top_metal.py; cd ..
-cd meerkat_work; gzip -d mlem_tm.gds.gz; cd ..
+```sh
+bin/artistic inspect examples/mlem/project.toml
+make PROJECT=examples/mlem/project.toml logo-prepare
+# In the environment that provides KLayout:
+make PROJECT=examples/mlem/project.toml logo-merge render-generate map-generate
+make PROJECT=examples/mlem/project.toml render-compose map-build
 ```
 
+`make all` runs the same stages in order when one environment provides both
+KLayout and the host image tools.
 
-Transform the logo to a 1-bit b/w image:
+The same commands work from another working directory. Paths in the TOML file
+are resolved relative to that file, not relative to the shell's current
+directory.
 
-```
-convert examples/mlem/mlem_logo.png -remap pattern:gray50 meerkat_work/mlem_logo_mono.png
-```
+The stages are also available as Make targets:
 
+| Target | Result |
+| --- | --- |
+| `inspect` | Detect the layout bounding box and routing stack |
+| `logo-prepare` | Convert artwork to a feature-grid mask |
+| `logo-merge` | Place complete mask features on the selected metal layer |
+| `render-generate` | Generate one raw mask per selected layer and segment |
+| `render-compose` | Apply colors and write PNG, JPEG, or PDF images |
+| `map-generate` | Generate raw masks for map tiles |
+| `map-build` | Assemble memory-bounded tile pyramids and an HTML viewer |
+| `all` | Run logo, render, and map stages in dependency order |
 
-Transform the logo to GDS:
+Run `bin/artistic --help` or `make -f Makefile -n all` to inspect the thin
+adapters without executing a stage.
 
-```
-python3 scripts/meerkat.py \
-    -m 210,210 \
-    -i meerkat_work/mlem_logo_mono.png \
-    -g meerkat_work/mlem_tm.gds \
-    -l 134 \
-    -n mlem \
-    -s meerkat_work/mlem_logo.svg \
-    -o meerkat_work/mlem_logo.gds
-```
+## Project file
 
+See [`examples/mlem/project.toml`](examples/mlem/project.toml). Users edit only
+the TOML file; JSON files in `work/` are generated records containing the
+resolved inputs and hashes used to reject stale later stages.
 
-Merge the logo into the chip:
+- `[design]` defines the project name, source GDS, and work directory.
+- `[technology]` may provide a technology file override.
+- `[logo]` defines artwork, physical width and height, feature size, selected
+  layer, and optional center offsets.
+- `[render]` and `[map]` define the input (`design`, `logo`, or another GDS),
+  viewport margin, resolution, segments, layers, palette, and outputs.
+- `[palettes.<name>]` contains the background and per-layer colors. A
+  `[render.colors.<layer>]` or `[map.colors.<layer>]` table overrides one color.
 
-```
-cd meerkat_work; klayout -zz -rm ../scripts/merge_logo.py; cd ..
-```
+`layers = "routing"` follows the routing stack in the technology file. A list
+selects exact layers. `top-metal` is an alias for the terminal routing layer.
+For maps, `views = "metals"` selects the metal layers from the generated set;
+`composite` is the colorized combination of all selected layers.
 
+Render and map viewports start at the actual GDS bounding box and expand by
+`margin_um`. Logo placement is centered in that box by default. Width, height,
+and `offset_x_um`/`offset_y_um` control its feature-grid canvas.
 
-This generates the file `meerkat_work/mlem_chip.gds.gz` containing the generated top-metal logo.
+Raw masks need to be regenerated after changing the input, resolution, segment
+grid, overrender factor, viewport margin, or selected layers. Colors, palettes,
+render formats, map views, tile size, and output directory are applied by the
+host stages and can be changed without rerunning KLayout.
 
+## Technology and tools
 
+Technology files are resolved in this order:
 
-## Ultra-High-Fidelity Rendering (RenderICs, formally Tapete)
+1. `[technology].file` in the project;
+2. `KLAYOUT_TECH_FILE`;
+3. `tech/$KLAYOUT_TECH.lyt` below each location in `KLAYOUT_PATH`.
 
-For this example to work, ensure the previously generated GDSII is present in the work directory:
+ArtistIC reads the technology connectivity graph to discover the routing stack
+and terminal metal. The KLayout worker inspects the actual GDS and writes raw
+layer masks. Image composition and map assembly run in ordinary Python.
 
-```
-mkdir -p /dev/shm/renderics
-cp meerkat_work/mlem_chip.gds.gz /dev/shm/renderics
-```
-
-
-Configuration is given through a `json` file. An example is provided in `examples/mlem/mlem.json`
-
-The configuration can be checked using the Makefile.
-Make sure to point this to a large enough temporary work directory (*abs path expected*)!
-
-```
-make CFG_FILE=examples/mlem/mlem.json analyze
-```
-
-
-The black/white database can be rendered using:
-
-```
-make CFG_FILE=examples/mlem/mlem.json gen_raw
-```
-
-
-The resulting PNGs and PDFs can be created using:
-
-```
-make CFG_FILE=examples/mlem/mlem.json gen_pdfs
-```
-
-In this example, the generated PDF is called `/dev/shm/renderics/PDF__mlem_0-0.pdf`
-The last step can be parallelized using the '-j' option.
-
-Profit!
-
-
-## Automatic Module Outline Generation
-
-***Module Outline Generation Only Tested for the [IHP 130nm Open PDK](https://github.com/IHP-GmbH/IHP-Open-PDK) and OpenROAD***
-
-With the information gathered from the chip's DEF file, ArtistIC can automatically annotate module
-outlines on top of renders.
-
-For the provided example, fetch `v0.1.0` of IHP's open PDK in the `pdk` directory:
-
-```
-git clone https://github.com/IHP-GmbH/IHP-Open-PDK.git --recursive --branch v0.1.0 pdk
-```
-
-Unzip the DEF file:
-
-```
-gzip -dc examples/mlem/mlem.def.gz > /dev/shm/renderics/mlem.def
-```
-
-A vector image containing the outlines can then be generated using:
-
-```
-python3 scripts/gen_outline.py \
-    -i /dev/shm/renderics/mlem.def \
-    -o /dev/shm/renderics/mlem_modules.svg \
-    -b /dev/shm/renderics/DPI__mlem_0-0.png \
-    --lef_files pdk/ihp-sg13g2/libs.ref/sg13g2_sram/lef/*.lef \
-    --px_scale 15000 \
-    --offset_x 100 \
-    --offset_y 83 \
-    --module_json examples/mlem/mlem_modules.json \
-    --opacity 0.65 \
-    --font_size 35 \
-    --luminosity 0.85
-```
-
-The resulting file is called `/dev/shm/renderics/mlem_modules.svg` and does not contain the bond pads.
-
+KLayout stages require KLayout with Python support. Host stages require Python
+3.11 or newer, Pillow, ImageMagick, and Inkscape for SVG artwork. Map viewers
+load Leaflet from its public CDN.
 
 ## License
-ArtistIC is released under Version 2.0 (Apache-2.0) see [`LICENSE`](LICENSE):
 
-
-## Contributing
-We are happy to accept pull requests and issues from any contributors. See [`CONTRIBUTING.md`](CONTRIBUTING.md)
-for additional information.
-
-
-## Prerequisites
-
-- [`ImageMagick  >= v6.9.12-93`](https://imagemagick.org/script/download.php)
-- [`Inkscape  >= v1.0.0`](inkscape.org)
-- [`Potrace  >= v1.15`](https://potrace.sourceforge.net/)
-- [`KLayout  >= v0.29.0`](https://www.klayout.de/build.html)
-- [`img2pdf  >= v0.4.4`](https://pypi.org/project/img2pdf)
-- [`gdspy  >= v1.6.13`](https://pypi.org/project/gdspy)
-- [`Pillow  >= v10.0.0`](https://pypi.org/project/pillow)
-- [`svgpathtools  >= v1.7.2`](https://pypi.org/project/svgpathtools)
+ArtistIC is licensed under Apache-2.0. See [`LICENSE`](LICENSE).
