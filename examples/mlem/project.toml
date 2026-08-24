@@ -1,0 +1,83 @@
+# Copyright 2026 ETH Zurich and University of Bologna.
+# Licensed under the Apache License, Version 2.0, see LICENSE for details.
+# SPDX-License-Identifier: Apache-2.0
+
+[design]
+name = "mlem"
+gds = "mlem_vanilla.gds.gz"
+work_dir = "work"
+repository = "pulp-platform/croc"
+
+[logo]
+source = "mlem_logo.svg"
+width_um = 1320
+height_um = 1320
+feature_um = 2
+layer = "top-metal"
+
+[render]
+input = "logo"
+resolution = [2200, 2200]
+segments = [1, 1]
+overrender = 2
+layers = "routing"
+margin_um = 100
+palette = "mlem"
+formats = ["png", "jpg", "pdf"]
+
+[map]
+input = "logo"
+resolution = [12288, 12288]
+segments = [3, 3]
+layers = "routing"
+margin_um = 100
+palette = "mlem"
+tile_size = 512
+output = "map"
+views = ["composite", "metals"]
+
+[palettes.mlem]
+background = "#ffffff"
+
+[palettes.mlem.layers.Cont]
+color = "#0000cd"
+alpha = 0.8
+[palettes.mlem.layers.Metal1]
+color = "#0000cd"
+alpha = 0.8
+[palettes.mlem.layers.Via1]
+color = "#7ccd7c"
+alpha = 0.7
+[palettes.mlem.layers.Metal2]
+color = "#7ccd7c"
+alpha = 0.7
+[palettes.mlem.layers.Via2]
+color = "#5c0c02"
+alpha = 0.6
+[palettes.mlem.layers.Metal3]
+color = "#5c0c02"
+alpha = 0.6
+[palettes.mlem.layers.Via3]
+color = "#cd3700"
+alpha = 0.5
+[palettes.mlem.layers.Metal4]
+color = "#cd3700"
+alpha = 0.5
+[palettes.mlem.layers.Via4]
+color = "#00cd00"
+alpha = 0.5
+[palettes.mlem.layers.Metal5]
+color = "#00cd00"
+alpha = 0.5
+[palettes.mlem.layers.TopVia1]
+color = "#7fffd4"
+alpha = 0.5
+[palettes.mlem.layers.TopMetal1]
+color = "#7fffd4"
+alpha = 0.5
+[palettes.mlem.layers.TopVia2]
+color = "#1e90ff"
+alpha = 0.5
+[palettes.mlem.layers.TopMetal2]
+color = "#ffffff"
+alpha = 0.8

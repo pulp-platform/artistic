@@ -1,0 +1,19 @@
+#!/bin/sh
+# Copyright 2026 ETH Zurich and University of Bologna.
+# Licensed under the Apache License, Version 2.0, see LICENSE for details.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PYTHONPATH="$root"
+PYTHONNOUSERSITE=1
+export PYTHONPATH PYTHONNOUSERSITE
+if [ -n "${PYTHON:-}" ]; then
+    python=$PYTHON
+elif command -v python3.11 >/dev/null 2>&1; then
+    python=python3.11
+else
+    python=python3
+fi
+exec "$python" -m artistic "$@"
