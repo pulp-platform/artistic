@@ -1,0 +1,16 @@
+#!/bin/sh
+# Copyright 2026 ETH Zurich and University of Bologna.
+# Licensed under the Apache License, Version 2.0, see LICENSE for details.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+python=${PYTHON:-python3}
+if ! "$python" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+    printf '%s\n' 'ArtistIC requires Python 3.11 or newer; select one with PYTHON=python3.11.' >&2
+    exit 2
+fi
+exec "$python" -m artistic "$@"
