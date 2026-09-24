@@ -13,12 +13,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from artistic import Project
-from artistic.project import ProjectError, sha256
-from artistic.technology import (inspect_layout, resolve, resolve_project,
-                                 selected_layers, technology_path)
 from artistic.logo import prepare as prepare_logo
+from artistic.map import _safe_output, _viewer, build as build_map
+from artistic.project import ProjectError, sha256
 from artistic.render import (_BorderStripReader, _colorize, _viewport, compose, generation_hash,
                              preserve_logo_resolution, verify_raw, _settings)
+from artistic.technology import (inspect_layout, resolve, resolve_project,
+                                 selected_layers, technology_path)
 
 
 TECH = """<technology><connectivity>
@@ -199,6 +200,58 @@ file = "../tech.lyt"
         script = Path(__file__).parents[1] / "bin" / "artistic"
         result = subprocess.run([str(script), "render", "compose", "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
+
+    def test_map_viewer_exposes_generated_views(self):
+        html = _viewer({"layers": ["composite", "Metal1"], "height": 100,
+                        "width": 200, "max_zoom": 2, "tile_size": 50})
+        self.assertIn("L.control.layers(layers)", html)
+        self.assertIn("map.unproject([200,0],maxZoom)", html)
+        self.assertIn('"composite", "Metal1"', html)
+
+    def test_map_output_cannot_follow_a_symlink_outside_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, outside = root / "work", root / "outside"
+            work.mkdir(); outside.mkdir()
+            (work / "link").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(ProjectError):
+                _safe_output({"design": {"work_dir": str(work)},
+                              "map": {"output": "link/map"}})
+
+    def test_map_output_protects_inputs_and_unmarked_user_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / "work"
+            raw = work / "raw" / "map"
+            raw.mkdir(parents=True)
+            source = work / "source.gds"
+            source.write_bytes(b"source")
+            technology = work / "tech.lyt"
+            technology.write_text(TECH)
+            project = work / "project.toml"
+            project.write_text("project")
+            user = work / "user"
+            user.mkdir()
+            sentinel = user / "keep.txt"
+            sentinel.write_text("keep")
+            (work / "linked").symlink_to(user, target_is_directory=True)
+            config = {"_project": str(project), "_root": str(work), "design": {
+                "name": "chip", "gds": str(source), "work_dir": str(work)},
+                "technology": {"file": "tech.lyt"},
+                "render": {"formats": ["png"]}, "map": {}}
+            for output in ("raw", "raw/map", "source.gds", "project.toml",
+                           "tech.lyt", "chip_render.png", "map.json", "linked",
+                           "linked/child"):
+                with self.subTest(output=output):
+                    config["map"]["output"] = output
+                    with self.assertRaises(ProjectError):
+                        _safe_output(config)
+            config["map"]["output"] = "user"
+            with self.assertRaisesRegex(ProjectError, "not an Artistic-generated map"):
+                from artistic.map import _prepare_output
+                _prepare_output(config, _safe_output(config))
+            self.assertEqual(sentinel.read_text(), "keep")
+            self.assertTrue(source.is_file())
+            self.assertTrue(raw.is_dir())
 
     def test_filename_components_and_segment_pixel_limits(self):
         from artistic.project import _project_name
@@ -620,3 +673,79 @@ file = "../tech.lyt"
             with self.assertRaises(ProjectError):
                 compose(config)
 
+    def test_map_build_reverses_klayout_y_and_writes_pyramid(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root, raw = Path(directory), Path(directory) / "raw"
+            raw.mkdir()
+            source = root / "chip.gds"
+            source.write_bytes(b"gds")
+            config = {
+                "design": {"name": "chip", "gds": str(source), "work_dir": str(root)},
+                "map": {"input": "design", "resolution": [4, 4], "segments": [2, 2],
+                        "layers": "routing", "output": "map", "tile_size": 2,
+                        "views": ["metals"], "composite": True, "palette": "test"},
+                "palettes": {"test": {"background": "#ffffff", "layers": {
+                    "Metal1": {"color": "#ff0000", "alpha": 1.0},
+                    "Metal2": {"color": "#0000ff", "alpha": 1.0},
+                }}},
+            }
+            layers = [
+                {"name": "Metal1", "layer": 8, "datatype": 0},
+                {"name": "Metal2", "layer": 10, "datatype": 0},
+            ]
+            raw_hashes = {}
+            for source_y in range(2):
+                for source_x in range(2):
+                    for layer in layers:
+                        image = Image.new("L", (2, 2), 255)
+                        if layer["name"] == "Metal1":
+                            if (source_y, source_x) == (1, 0):
+                                image.putpixel((0, 0), 0)
+                            if (source_y, source_x) == (0, 0):
+                                image.putpixel((1, 1), 0)
+                        name = (f"RAW__chip_{layer['layer']}.0.{layer['name']}_"
+                                f"{source_y}-{source_x}.png")
+                        path = raw / name
+                        image.save(path)
+                        raw_hashes[name] = sha256(path)
+            settings = {
+                "record_version": 2, "section": "map", "chip": "chip", "input": "chip.gds",
+                "input_sha256": sha256(source),
+                "generation_sha256": generation_hash(config, "map"),
+                "raw_dir": "raw", "raw_sha256": raw_hashes,
+                "resolution": [4, 4], "segments": [2, 2], "layers": layers,
+                "technology": {"top_metal": "Metal2"},
+            }
+            (root / "map.json").write_text(json.dumps(settings))
+            output = build_map(config)
+            stale = output / "stale.txt"
+            stale.write_text("old")
+            output = build_map(config)
+            self.assertFalse(stale.exists())
+            metadata = json.loads((output / "map.json").read_text())
+            self.assertEqual(metadata["layers"], ["composite", "Metal1", "Metal2"])
+            self.assertTrue((output / "composite" / "0" / "0" / "0.png").is_file())
+            top = Image.open(output / "composite" / "1" / "0" / "0.png").convert("RGB")
+            bottom = Image.open(output / "composite" / "1" / "0" / "1.png").convert("RGB")
+            self.assertEqual(top.getpixel((0, 0)), (255, 0, 0))
+            self.assertEqual(bottom.getpixel((1, 1)), (255, 0, 0))
+            config["palettes"]["test"]["layers"]["Metal1"]["color"] = "#00ff00"
+            output = build_map(config)
+            recolored = Image.open(output / "composite" / "1" / "0" / "0.png").convert("RGB")
+            self.assertEqual(recolored.getpixel((0, 0)), (0, 255, 0))
+            config["map"].update({"views": ["missing"], "composite": False})
+            with self.assertRaises(ProjectError):
+                build_map(config)
+            config["map"].update({"views": ["metals"], "composite": True})
+            config["technology"] = {"layers": {"Metal1": "9/0"}}
+            with self.assertRaisesRegex(ProjectError, "generation settings changed"):
+                build_map(config)
+
+
+if __name__ == "__main__":
+    unittest.main()
