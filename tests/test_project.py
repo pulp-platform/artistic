@@ -16,6 +16,7 @@ from artistic import Project
 from artistic.project import ProjectError, sha256
 from artistic.technology import (inspect_layout, resolve, resolve_project,
                                  selected_layers, technology_path)
+from artistic.logo import prepare as prepare_logo
 
 
 TECH = """<technology><connectivity>
@@ -196,4 +197,64 @@ file = "../tech.lyt"
         script = Path(__file__).parents[1] / "bin" / "artistic"
         result = subprocess.run([str(script), "render", "compose", "--help"], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0)
+
+    def test_logo_prepare_bitmap_flattens_thresholds_and_resizes(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "logo.png"
+            with Image.new("RGBA", (3, 1)) as artwork:
+                artwork.putdata(((0, 0, 0, 255), (0, 0, 0, 0),
+                                 (128, 128, 128, 255)))
+                artwork.save(source)
+            config = {"design": {"name": "chip", "work_dir": str(root)},
+                      "logo": {"source": str(source), "width_um": 3,
+                               "height_um": 1, "feature_um": 1}}
+            with patch("artistic.logo.tool", side_effect=AssertionError("external tool")):
+                output = prepare_logo(config)
+            with Image.open(output) as mask:
+                self.assertEqual(mask.size, (3, 1))
+                self.assertEqual(list(mask.getdata()), [0, 255, 255])
+            record = json.loads((root / "logo_prepare.json").read_text())
+            self.assertEqual(record["mask_sha256"], sha256(output))
+
+            config["logo"]["width_um"] = 6
+            output = prepare_logo(config)
+            with Image.open(output) as mask:
+                self.assertEqual(mask.size, (6, 1))
+                self.assertEqual(set(mask.getdata()), {0, 255})
+
+    def test_logo_prepare_svg_keeps_template_and_inkscape(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "logo.svg"
+            source.write_text("<svg>{{repository}}</svg>")
+            config = {"_root": str(root),
+                      "design": {"name": "chip", "work_dir": str(root),
+                                 "repository": "example/repo"},
+                      "logo": {"source": str(source), "width_um": 2,
+                               "height_um": 2, "feature_um": 1}}
+            def rasterize(command):
+                self.assertEqual(command[0], "inkscape")
+                self.assertIn("--export-width=2", command)
+                self.assertIn("--export-height=2", command)
+                rendered = Path(next(value.split("=", 1)[1] for value in command
+                                     if value.startswith("--export-filename=")))
+                Image.new("RGB", (2, 2), "black").save(rendered)
+
+            with (patch("artistic.logo.tool", return_value="inkscape") as tool,
+                  patch("artistic.logo.run_checked", side_effect=rasterize) as run):
+                output = prepare_logo(config)
+            tool.assert_called_once_with("inkscape")
+            run.assert_called_once()
+            self.assertIn("example/repo", (root / "chip_logo.svg").read_text())
+            with Image.open(output) as mask:
+                self.assertEqual(list(mask.getdata()), [0] * 4)
 
