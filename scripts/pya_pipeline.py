@@ -144,6 +144,85 @@ def logo_merge(request):
                     logo_region.bbox().right, logo_region.bbox().top]}, stream)
 
 
+def render(request):
+    """Render each requested layer and segment without a generated macro/config."""
+    layout = pya.Layout()
+    layout.read(request["gds"])
+    tops = layout.top_cells()
+    if len(tops) != 1:
+        raise RuntimeError("input GDS must have exactly one top cell")
+    x0, y0, x1, y1 = [float(value) / layout.dbu for value in request["viewport_um"]]
+    width_px, height_px = [int(value) * int(request.get("overrender", 1))
+                           for value in request["resolution"]]
+    segments_x, segments_y = [int(value) for value in request["segments"]]
+    if min(width_px, height_px, segments_x, segments_y) <= 0:
+        raise RuntimeError("render dimensions and segment counts must be positive")
+    # Use one physical pixel pitch in both directions.  Padding the shorter
+    # axis preserves geometry when the requested image and layout have
+    # different aspect ratios.
+    dbu_per_px = max((x1 - x0) / width_px, (y1 - y0) / height_px)
+    center_x, center_y = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    x0, x1 = center_x - width_px * dbu_per_px / 2.0, center_x + width_px * dbu_per_px / 2.0
+    y0, y1 = center_y - height_px * dbu_per_px / 2.0, center_y + height_px * dbu_per_px / 2.0
+    view = pya.LayoutView()
+    view.set_config("background-color", "#FFFFFF")
+    view.set_config("grid-visible", "false")
+    view.set_config("text-visible", "false")
+    view.show_layout(layout, 0)
+    view.active_cellview().cell = tops[0]
+    view.max_hier()
+    layers = []
+    iterator = view.begin_layers()
+    while not iterator.at_end():
+        current = iterator.current()
+        layer_index = current.layer_index
+        if callable(layer_index):
+            layer_index = layer_index()
+        if layer_index >= 0:
+            current.visible = False
+            layers.append(current)
+        iterator.next()
+    requested = {(int(item["layer"]), int(item["datatype"])): item["name"]
+                 for item in request["layers"]}
+    output = os.path.abspath(request["raw_dir"])
+    os.makedirs(output, exist_ok=True)
+    for properties in layers:
+        layer_index = properties.layer_index
+        if callable(layer_index):
+            layer_index = layer_index()
+        info = layout.get_info(layer_index)
+        name = requested.get((info.layer, info.datatype))
+        if name is None:
+            continue
+        properties.frame_color = 0
+        properties.fill_color = 0
+        properties.frame_brightness = 0
+        properties.fill_brightness = 0
+        properties.dither_pattern = 0
+        properties.transparent = False
+        properties.visible = True
+        for source_y in range(segments_y):
+            pixel_bottom = round(height_px * source_y / segments_y)
+            pixel_top = round(height_px * (source_y + 1) / segments_y)
+            bottom = y0 + pixel_bottom * dbu_per_px
+            top = y0 + pixel_top * dbu_per_px
+            for source_x in range(segments_x):
+                pixel_left = round(width_px * source_x / segments_x)
+                pixel_right = round(width_px * (source_x + 1) / segments_x)
+                left = x0 + pixel_left * dbu_per_px
+                right = x0 + pixel_right * dbu_per_px
+                box = pya.DBox(left * layout.dbu, bottom * layout.dbu,
+                               right * layout.dbu, top * layout.dbu)
+                view.zoom_box(box)
+                segment_width = max(1, pixel_right - pixel_left)
+                segment_height = max(1, pixel_top - pixel_bottom)
+                target = os.path.join(output, "RAW__%s_%d.%d.%s_%d-%d.png" %
+                                     (request["chip"], info.layer, info.datatype, name,
+                                      source_y, source_x))
+                view.save_image(target, segment_width, segment_height)
+        properties.visible = False
+
+
 def main():
     request_path = os.environ.get("ARTISTIC_PYA_REQUEST")
     if not request_path:
@@ -160,6 +239,8 @@ def main():
         inspect(request)
     elif operation == "logo_merge":
         logo_merge(request)
+    elif operation == "render":
+        render(request)
     else:
         raise RuntimeError("unknown PYA operation: %s" % operation)
 
