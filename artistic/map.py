@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from .project import ProjectError, _project_name, input_gds, recorded_path, sha256, work_relative
 from .render import _colorize, _open_raw, generation_hash, raw_layout, verify_raw
+from .palettes import background_rgba
 from .technology import palette
 
 
@@ -44,7 +46,7 @@ def _safe_output(config: dict, raw_dir: Path | None = None) -> Path:
         raise ProjectError("[map].output must not be [design].work_dir itself")
     work = root
     protected = [work / "raw", *(work / name for name in (
-        "render.json", "map.json", "logo_prepare.json", "logo_merge.json",
+        "render.json", "render_output.json", "map.json", "logo_prepare.json", "logo_merge.json",
         "manifest.json", "layout.json"))]
     if raw_dir is not None:
         protected.append(raw_dir)
@@ -63,12 +65,23 @@ def _safe_output(config: dict, raw_dir: Path | None = None) -> Path:
         value = config.get(section, {}).get("input")
         if value and value not in ("design", "logo"):
             protected.append(Path(value))
+    outlines = config.get("render", {}).get("outlines", {})
+    if isinstance(outlines, dict):
+        project_root = Path(config.get("_root", root))
+        if outlines.get("def"):
+            value = Path(outlines["def"]).expanduser()
+            protected.append(value if value.is_absolute() else project_root / value)
+        for pattern in outlines.get("lef_files", []):
+            value = Path(pattern).expanduser()
+            absolute = value if value.is_absolute() else project_root / value
+            protected.extend(Path(match) for match in glob.glob(str(absolute), recursive=True))
     chip = _project_name(config) if config.get("design", {}).get("gds") else ""
     if chip:
         protected.extend(work / f"{chip}_{suffix}" for suffix in (
-            "logo_mono.png", "logo.svg", "logo_render.png", "logo.gds", "chip.gds.gz"))
-        protected.extend(work / f"{chip}_render.{str(fmt).lower().lstrip('.')}"
-                         for fmt in config.get("render", {}).get("formats", ["png", "jpg", "pdf"]))
+            "logo_mono.png", "logo.svg", "logo_render.png", "logo.gds", "chip.gds.gz",
+            "poster.pdf", "modules.svg", "modules.png", "modules.pdf", "modules.jpg"))
+        protected.extend(work / f"{chip}_render.{fmt}"
+                         for fmt in ("png", "jpg", "jpeg", "pdf"))
     for item in protected:
         item = item.resolve()
         if path == item or path in item.parents or item in path.parents:
@@ -97,7 +110,7 @@ def _prepare_output(config: dict, output: Path) -> None:
         "output": work_relative(config, output)}, sort_keys=True) + "\n")
 
 
-def _tile_writer(output: Path, tile_size: int, zoom: int, background):
+def _tile_writer(output: Path, tile_size: int, zoom: int, background, layer_style: str):
     from PIL import Image
 
     def write(name, image, left, top):
@@ -110,19 +123,21 @@ def _tile_writer(output: Path, tile_size: int, zoom: int, background):
                     with Image.open(target) as existing:
                         tile = existing.convert("RGBA")
                 else:
-                    fill = background + (255,) if name == "composite" else (0, 0, 0, 0)
+                    fill = (background if name == "composite" else
+                            (255, 255, 255, 255) if layer_style == "mask" else
+                            (0, 0, 0, 0))
                     tile = Image.new("RGBA", (tile_size, tile_size), fill)
                 left_i, top_i = max(left, tx * tile_size), max(top, ty * tile_size)
                 right_i, bottom_i = min(right, (tx + 1) * tile_size), min(bottom, (ty + 1) * tile_size)
                 crop = image.crop((left_i - left, top_i - top, right_i - left, bottom_i - top))
-                tile.alpha_composite(crop, (left_i - tx * tile_size, top_i - ty * tile_size))
+                tile.paste(crop, (left_i - tx * tile_size, top_i - ty * tile_size))
                 tile.save(target)
                 tile.close()
     return write
 
 
 def build(config: dict) -> Path:
-    from PIL import Image, ImageColor
+    from PIL import Image
     work = Path(config["design"]["work_dir"])
     path = work / "map.json"
     if not path.is_file():
@@ -142,6 +157,9 @@ def build(config: dict) -> Path:
     tile_size = int(config.get("map", {}).get("tile_size", 512))
     if tile_size <= 0:
         raise ProjectError("[map].tile_size must be positive")
+    layer_style = config.get("map", {}).get("layer_style", "mask")
+    if layer_style not in ("mask", "color"):
+        raise ProjectError("[map].layer_style must be 'mask' or 'color'")
     selected = [item["name"] for item in settings["layers"]]
     requested = config.get("map", {}).get("views", config.get("map", {}).get("layers", "routing"))
     names = list(selected) if requested in ("routing", "all") else ([requested] if isinstance(requested, str) else list(requested))
@@ -162,32 +180,43 @@ def build(config: dict) -> Path:
         raise ProjectError("[map].views selects no generated views")
     resolved_layers = [(item["name"], item["layer"], item["datatype"])
                        for item in settings["layers"]]
-    colors = palette(config, config.get("map", {}), resolved_layers)
-    for color in colors.values():
-        ImageColor.getrgb(color if isinstance(color, str) else color["color"])
-    background = colors.pop("background")
-    bg = ImageColor.getrgb(background)[:3]
+    colors = palette(config, config.get("map", {}), resolved_layers,
+                     routing=settings.get("technology", {}).get("routing"))
+    bg = background_rgba(colors.pop("background"))
     output = _safe_output(config, Path(settings["raw_dir"]))
     _prepare_output(config, output)
     max_zoom = max(0, math.ceil(math.log(max(raw["width"], raw["height"]) / tile_size, 2)))
-    write_tile = _tile_writer(output, tile_size, max_zoom, bg)
+    write_tile = _tile_writer(output, tile_size, max_zoom, bg, layer_style)
     xoffset = [0]
     for width in raw["widths"][:-1]: xoffset.append(xoffset[-1] + width)
     yoffset, logical = [0], list(reversed(range(raw["segments"][1])))
     for source_y in logical[:-1]: yoffset.append(yoffset[-1] + raw["heights"][source_y])
     for logical_y, source_y in enumerate(logical):
         for source_x in range(raw["segments"][0]):
-            composite = Image.new("RGBA", (raw["widths"][source_x], raw["heights"][source_y]), (0, 0, 0, 0))
+            composite = (Image.new("RGBA", (raw["widths"][source_x], raw["heights"][source_y]),
+                                   bg) if "composite" in names else None)
             for item in settings["layers"]:
+                name = item["name"]
+                if composite is None and name not in names:
+                    continue
                 with _open_raw(settings, raw["paths"][item["name"]][(source_y, source_x)]) as source_image:
                     mask = source_image.convert("L")
-                color = colors[item["name"]]
-                layer = _colorize(mask, color["color"], color["alpha"])
+                if name in names and layer_style == "mask":
+                    mask_view = mask.convert("RGB").convert("RGBA")
+                    write_tile(name, mask_view, xoffset[source_x], yoffset[logical_y])
+                    mask_view.close()
+                if composite is not None or (name in names and layer_style == "color"):
+                    color = colors[name]
+                    layer = _colorize(mask, color["color"], color["alpha"])
+                    if name in names and layer_style == "color":
+                        write_tile(name, layer, xoffset[source_x], yoffset[logical_y])
+                    if composite is not None:
+                        composite.alpha_composite(layer)
+                    layer.close()
                 mask.close()
-                if item["name"] in names: write_tile(item["name"], layer, xoffset[source_x], yoffset[logical_y])
-                composite.alpha_composite(layer); layer.close()
-            if "composite" in names: write_tile("composite", composite, xoffset[source_x], yoffset[logical_y])
-            composite.close()
+            if composite is not None:
+                write_tile("composite", composite, xoffset[source_x], yoffset[logical_y])
+                composite.close()
     # Build the lower zoom levels from four children at a time.  Only one
     # parent canvas is kept in memory, so large maps do not scale with the
     # number of tiles.
@@ -199,15 +228,17 @@ def build(config: dict) -> Path:
             factor = 2 ** (max_zoom - zoom)
             for tx in range(max(1, math.ceil(nx / factor))):
                 for ty in range(max(1, math.ceil(ny / factor))):
-                    canvas = Image.new("RGBA", (tile_size * 2, tile_size * 2),
-                                       bg + (255,) if name == "composite" else (0, 0, 0, 0))
+                    fill = (bg if name == "composite" else
+                            (255, 255, 255, 255) if layer_style == "mask" else
+                            (0, 0, 0, 0))
+                    canvas = Image.new("RGBA", (tile_size * 2, tile_size * 2), fill)
                     for dx in (0, 1):
                         for dy in (0, 1):
                             child = layer_root / str(zoom + 1) / str(2 * tx + dx) / f"{2 * ty + dy}.png"
                             if child.is_file():
                                 with Image.open(child) as image:
-                                    canvas.alpha_composite(image.convert("RGBA"),
-                                                           (dx * tile_size, dy * tile_size))
+                                    canvas.paste(image.convert("RGBA"),
+                                                 (dx * tile_size, dy * tile_size))
                     target = layer_root / str(zoom) / str(tx) / f"{ty}.png"
                     target.parent.mkdir(parents=True, exist_ok=True)
                     canvas.resize((tile_size, tile_size), Image.Resampling.LANCZOS).save(target)

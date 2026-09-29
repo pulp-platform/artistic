@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import hashlib
-import tempfile
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 
 from .project import (ProjectError, _project_name, filename_component, input_gds,
                       project_relative, recorded_path, sha256, work_relative, write_json)
+from .image_outputs import (_number, _pdf_modules, jpeg_image, poster_options,
+                            write_pdf, write_poster)
+from .palettes import background_rgba
 from .technology import inspect_layout, palette, selected_layers, run_pya
 
 
@@ -315,23 +316,21 @@ def _colorize(mask, color: str, alpha: float):
 
 
 def _pdf_resolution(width: int, page_width_cm: object) -> float:
-    try:
-        page_width = float(page_width_cm)
-    except (TypeError, ValueError) as exc:
-        raise ProjectError("[render].page_width_cm must be a positive number") from exc
-    if not math.isfinite(page_width) or page_width <= 0:
-        raise ProjectError("[render].page_width_cm must be a positive number")
+    page_width = _number(page_width_cm, "[render].page_width_cm", positive=True)
     return width * 2.54 / page_width
 
 
 def compose(config: dict) -> list[Path]:
     from PIL import Image
-    path = Path(config["design"]["work_dir"]) / "render.json"
+    work = Path(config["design"]["work_dir"])
+    path = work / "render.json"
     if not path.is_file():
         raise ProjectError("render config not found; run render generate first")
     settings = json.loads(path.read_text())
     if settings.get("record_version") != 2:
         raise ProjectError("render record is outdated; run render generate again")
+    receipt = work / "render_output.json"
+    receipt.unlink(missing_ok=True)
     source = input_gds(config, "render")
     if (work_relative(config, source) != settings.get("input") or
             sha256(source) != settings.get("input_sha256") or
@@ -342,12 +341,35 @@ def compose(config: dict) -> list[Path]:
     verify_raw(settings)
     selected = [(item["name"], item["layer"], item["datatype"])
                 for item in settings["layers"]]
-    colors = palette(config, config.get("render", {}), selected)
-    background = colors.pop("background")
+    render = config.get("render", {})
+    routing = settings.get("technology", {}).get("routing")
+    colors = palette(config, render, selected, routing=routing)
+    background = background_rgba(colors.pop("background"))
     resolution = tuple(settings["resolution"])
-    page_width_cm = config.get("render", {}).get("page_width_cm")
+    page_width_cm = render.get("page_width_cm")
     pdf_resolution = (_pdf_resolution(resolution[0], page_width_cm)
                       if page_width_cm is not None else 300)
+    formats = render.get("formats", ["png", "jpg", "pdf"])
+    if not isinstance(formats, list):
+        raise ProjectError("[render].formats must be a list")
+    suffixes = [str(fmt).lower().lstrip(".") for fmt in formats]
+    if any(suffix not in ("png", "jpg", "jpeg", "pdf") for suffix in suffixes):
+        raise ProjectError("[render].formats supports png, jpg, jpeg, and pdf")
+    outlines = render.get("outlines")
+    if outlines is not None and not isinstance(outlines, dict):
+        raise ProjectError("[render.outlines] must be a table")
+    if isinstance(outlines, dict) and outlines.get("enabled", True) and "png" not in suffixes:
+        suffixes.append("png")
+    poster = poster_options(render["poster"]) if "poster" in render else None
+    jpeg_background = background_rgba(render.get("jpeg_background", "#ffffff"))
+    if jpeg_background[3] != 255:
+        raise ProjectError("[render].jpeg_background must be opaque")
+    if "pdf" in suffixes or poster is not None:
+        _pdf_modules(poster=poster is not None)
+    if "pdf" in suffixes and any(size < 3 or size > 14400 for size in
+                                 (resolution[0] * 72 / pdf_resolution,
+                                  resolution[1] * 72 / pdf_resolution)):
+        raise ProjectError("render PDF page is outside the supported size range")
     raw = raw_layout(settings)
     image = Image.new("RGBA", resolution, background)
     sx, sy = raw["segments"]
@@ -424,35 +446,36 @@ def compose(config: dict) -> list[Path]:
                 finally:
                     segment.close()
     outputs = []
-    work = Path(config["design"]["work_dir"])
+    png_target = None
     try:
-        for fmt in config.get("render", {}).get("formats", ["png", "jpg", "pdf"]):
-            suffix = str(fmt).lower().lstrip(".")
+        for suffix in suffixes:
             target = work / f"{_project_name(config)}_render.{suffix}"
-            if suffix in ("pdf", "jpg", "jpeg"):
-                converted = image.convert("RGB")
+            if suffix == "pdf":
+                with _pixel_limit(image.width * image.height):
+                    write_pdf(image, target, pdf_resolution)
+            elif suffix in ("jpg", "jpeg"):
+                converted = jpeg_image(image, jpeg_background[:3])
                 try:
-                    if suffix == "pdf":
-                        try:
-                            import img2pdf
-                        except ImportError as exc:
-                            raise ProjectError("PDF output requires img2pdf") from exc
-                        with tempfile.NamedTemporaryFile(suffix=".png", dir=work) as png:
-                            converted.save(png, "PNG")
-                            png.flush()
-                            layout = img2pdf.get_fixed_dpi_layout_fun(
-                                (pdf_resolution, pdf_resolution))
-                            with target.open("wb") as output:
-                                with _pixel_limit(converted.width * converted.height):
-                                    img2pdf.convert(png.name, layout_fun=layout,
-                                                    outputstream=output)
-                    else:
-                        converted.save(target, quality=95)
+                    converted.save(target, quality=95)
                 finally:
                     converted.close()
             else:
                 image.save(target)
+                png_target = target
             outputs.append(target)
+        if poster is not None:
+            target = work / f"{_project_name(config)}_poster.pdf"
+            with _pixel_limit(image.width * image.height):
+                write_poster(image, target, poster)
+            outputs.append(target)
+        if png_target is not None:
+            write_json(receipt, {"version": 1, "image": work_relative(config, png_target),
+                                 "image_sha256": sha256(png_target),
+                                 "render_record_sha256": sha256(path),
+                                 "generation_sha256": settings["generation_sha256"],
+                                 "source_sha256": settings["input_sha256"],
+                                 "resolution": list(resolution),
+                                 "viewport_um": settings.get("gds", {}).get("viewport_um")})
     finally:
         image.close()
     return outputs
