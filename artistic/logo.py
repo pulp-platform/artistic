@@ -9,12 +9,64 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import math
 import subprocess
 from pathlib import Path
 
 from .project import (ProjectError, _project_name, project_relative, run_checked,
                       sha256, tool, write_json)
 from .technology import layer, inspect_layout, run_pya
+
+
+def _preprocessing(settings: dict) -> dict:
+    def number(key: str, default: float) -> float:
+        try:
+            value = float(settings.get(key, default))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ProjectError(f"[logo].{key} must be a finite number") from exc
+        if not math.isfinite(value):
+            raise ProjectError(f"[logo].{key} must be a finite number")
+        return value
+
+    feature = number("feature_um", 2.0)
+    width = number("width_um", 0)
+    height = number("height_um", 0)
+    if min(feature, width, height) <= 0:
+        raise ProjectError("[logo] width_um, height_um, and feature_um must be positive")
+    dither = settings.get("dither", "threshold")
+    if dither not in ("threshold", "floyd-steinberg", "ordered"):
+        raise ProjectError("[logo].dither must be threshold, floyd-steinberg, or ordered")
+    threshold = number("threshold", 0.5)
+    contrast = number("contrast", 1.0)
+    if not 0 <= threshold <= 1:
+        raise ProjectError("[logo].threshold must be between 0 and 1")
+    if contrast <= 0:
+        raise ProjectError("[logo].contrast must be positive")
+    width_ratio, height_ratio = width / feature, height / feature
+    if not math.isfinite(width_ratio) or not math.isfinite(height_ratio):
+        raise ProjectError("[logo] width_um and height_um are too large for feature_um")
+    return {"width_px": max(1, round(width_ratio)),
+            "height_px": max(1, round(height_ratio)),
+            "feature_um": feature, "dither": dither,
+            "threshold": threshold, "contrast": contrast}
+
+
+def _binary_mask(grayscale, settings: dict):
+    from PIL import Image
+
+    if settings["dither"] == "threshold":
+        return grayscale.point(lambda value: 255 if value >= 255 * settings["threshold"] else 0)
+    if settings["dither"] == "floyd-steinberg":
+        dither = getattr(getattr(Image, "Dither", Image), "FLOYDSTEINBERG")
+        with grayscale.convert("1", dither=dither) as binary:
+            return binary.convert("L")
+    bayer = ((0, 8, 2, 10), (12, 4, 14, 6),
+             (3, 11, 1, 9), (15, 7, 13, 5))
+    mask = Image.new("L", grayscale.size)
+    mask.putdata([255 if value >= (bayer[(index // grayscale.width) % 4]
+                                  [index % grayscale.width % 4] + 0.5) * 255 / 16 else 0
+                  for index, value in enumerate(grayscale.getdata())])
+    return mask
 
 
 def _expanded_source(config: dict, source: Path) -> tuple[str | None, str]:
@@ -40,12 +92,8 @@ def prepare(config: dict) -> Path:
     source = settings.get("source")
     if not source:
         raise ProjectError("[logo].source is required for logo prepare")
-    feature = float(settings.get("feature_um", 2.0))
-    width = float(settings.get("width_um", 0))
-    height = float(settings.get("height_um", 0))
-    if min(feature, width, height) <= 0:
-        raise ProjectError("[logo] width_um, height_um, and feature_um must be positive")
-    width_px, height_px = max(1, round(width / feature)), max(1, round(height / feature))
+    preprocessing = _preprocessing(settings)
+    width_px, height_px = preprocessing["width_px"], preprocessing["height_px"]
     work = Path(config["design"]["work_dir"])
     work.mkdir(parents=True, exist_ok=True)
     output = work / f"{_project_name(config)}_logo_mono.png"
@@ -61,7 +109,7 @@ def prepare(config: dict) -> Path:
         run_checked([tool("inkscape"), str(templated), f"--export-filename={rendered}",
                      f"--export-width={width_px}", f"--export-height={height_px}"])
         input_path = rendered
-    from PIL import Image
+    from PIL import Image, ImageEnhance
     resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
     with Image.open(input_path) as source_image:
         with source_image.convert("RGBA") as rgba:
@@ -70,15 +118,16 @@ def prepare(config: dict) -> Path:
                     with resized.getchannel("A") as alpha:
                         flattened.paste(resized, mask=alpha)
                     with flattened.convert("L") as grayscale:
-                        with grayscale.point(lambda value: 255 if value >= 128 else 0) as mask:
-                            mask.save(output)
+                        with ImageEnhance.Contrast(grayscale).enhance(preprocessing["contrast"]) as contrasted:
+                            with _binary_mask(contrasted, preprocessing) as mask:
+                                mask.save(output)
     if not output.is_file() or output.stat().st_size == 0:
         raise ProjectError(f"logo prepare produced no mask: {output}")
     write_json(work / "logo_prepare.json", {
-        "record_version": 2, "chip": _project_name(config),
+        "record_version": 3, "chip": _project_name(config),
         "source": project_relative(config, source_path), "source_sha256": sha256(source_path),
         "expanded_source_sha256": expanded_digest, "mask_sha256": sha256(output),
-        "width_px": width_px, "height_px": height_px, "feature_um": feature,
+        **preprocessing,
         "repository": config.get("design", {}).get("repository", "")})
     return output
 
@@ -86,23 +135,26 @@ def prepare(config: dict) -> Path:
 def _mask_rows(path: Path) -> tuple[int, int, list[dict]]:
     try:
         from PIL import Image
-        image = Image.open(path).convert("L")
+        with Image.open(path) as source:
+            image = source.convert("L")
     except (OSError, ImportError) as exc:
         raise ProjectError(f"cannot read prepared logo mask {path}: {exc}") from exc
-    rows = []
-    for y in range(image.height):
-        pixels = [value < 128 for value in image.crop((0, y, image.width, y + 1)).getdata()]
-        runs, start = [], None
-        for x, foreground in enumerate(pixels + [False]):
-            if foreground and start is None:
-                start = x
-            elif not foreground and start is not None:
-                runs.append([start, x]); start = None
-        if runs:
-            rows.append({"y": y, "runs": runs})
+    with image:
+        rows = []
+        for y in range(image.height):
+            pixels = [value < 128 for value in image.crop((0, y, image.width, y + 1)).getdata()]
+            runs, start = [], None
+            for x, foreground in enumerate(pixels + [False]):
+                if foreground and start is None:
+                    start = x
+                elif not foreground and start is not None:
+                    runs.append([start, x]); start = None
+            if runs:
+                rows.append({"y": y, "runs": runs})
+        width, height = image.size
     if not rows:
         raise ProjectError(f"prepared logo mask has no foreground pixels: {path}")
-    return image.width, image.height, rows
+    return width, height, rows
 
 
 def merge(config: dict, technology: str | Path | None = None) -> Path:
@@ -114,13 +166,11 @@ def merge(config: dict, technology: str | Path | None = None) -> Path:
     source = Path(config["logo"]["source"])
     if not source.is_file():
         raise ProjectError(f"logo source not found: {source}")
-    feature = float(config["logo"].get("feature_um", 2.0))
-    expected = {"record_version": 2, "chip": _project_name(config),
+    preprocessing = _preprocessing(config["logo"])
+    expected = {"record_version": 3, "chip": _project_name(config),
                 "source": project_relative(config, source), "source_sha256": sha256(source),
                 "expanded_source_sha256": _expanded_source(config, source)[1],
-                "width_px": max(1, round(float(config["logo"].get("width_um", 0)) / feature)),
-                "height_px": max(1, round(float(config["logo"].get("height_um", 0)) / feature)),
-                "feature_um": feature,
+                **preprocessing,
                 "repository": config.get("design", {}).get("repository", "")}
     prepared = json.loads(record.read_text())
     mask_digest = prepared.pop("mask_sha256", None)
@@ -137,7 +187,7 @@ def merge(config: dict, technology: str | Path | None = None) -> Path:
              "layer": number, "datatype": datatype, "bbox_dbu": layout["bbox_dbu"],
              "logo_cell": f"{_project_name(config)}_logo", "chip_cell": f"{_project_name(config)}_chip",
              "rows": rows, "width_px": width_px, "height_px": height_px,
-             "feature_um": feature, "offset_x_um": float(config["logo"].get("offset_x_um", 0)),
+             "feature_um": preprocessing["feature_um"], "offset_x_um": float(config["logo"].get("offset_x_um", 0)),
              "offset_y_um": float(config["logo"].get("offset_y_um", 0)),
              "logo_gds": str(logo_gds), "chip_gds": str(chip_gds), "result": str(result)})
     if not logo_gds.is_file() or not chip_gds.is_file():
