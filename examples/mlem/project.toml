@@ -14,6 +14,7 @@ width_um = 1320
 height_um = 1320
 feature_um = 2
 layer = "top-metal"
+dither = "threshold"
 
 [render]
 input = "logo"
@@ -35,6 +36,7 @@ palette = "mlem"
 tile_size = 512
 output = "map"
 views = ["composite", "metals"]
+layer_style = "mask"
 
 [palettes.mlem]
 background = "#ffffff"

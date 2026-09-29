@@ -44,10 +44,19 @@ gds = "../chip.gds"
 work_dir = "out"
 [technology]
 file = "../tech.lyt"
+[render.outlines]
+def = "../chip.def"
+lef_files = ["../lef/*.lef"]
 """)
             project = Project.load(project_file)
             self.assertEqual(project.config["design"]["gds"], str((root / "chip.gds").resolve()))
             self.assertEqual(project.config["technology"]["file"], "../tech.lyt")
+            self.assertEqual(project.config["render"]["outlines"]["def"], str(root / "chip.def"))
+            self.assertEqual(project.config["render"]["outlines"]["lef_files"],
+                             [str(root / "lef" / "*.lef")])
+            with patch("artistic.outlines.annotate", return_value=[]) as annotate:
+                self.assertEqual(project.annotate_render(), [])
+                annotate.assert_called_once_with(project.config)
 
     def test_technology_stack_and_priority(self):
         with tempfile.TemporaryDirectory() as directory:

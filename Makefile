@@ -5,7 +5,7 @@
 PROJECT ?= examples/mlem/project.toml
 ARTISTIC ?= ./bin/artistic
 
-.PHONY: all inspect logo-prepare logo-merge logo render-generate render-compose render \
+.PHONY: all inspect logo-prepare logo-merge logo render-generate render-compose render-annotate render \
         map-generate map-build map
 
 all:
@@ -25,6 +25,8 @@ render-generate:
 	$(ARTISTIC) render generate $(PROJECT)
 render-compose:
 	$(ARTISTIC) render compose $(PROJECT)
+render-annotate:
+	$(ARTISTIC) render annotate $(PROJECT)
 render:
 	$(MAKE) render-generate
 	$(MAKE) render-compose
