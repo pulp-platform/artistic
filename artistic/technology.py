@@ -13,6 +13,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from .palettes import palette
 from .project import ProjectError, run_checked, tool, write_json
 
 
@@ -256,15 +257,3 @@ def selected_layers(section: dict, tech: dict, layout: dict) -> list[tuple[str, 
         if (source["layer"], source["datatype"]) in present:
             selected.append((name, source["layer"], source["datatype"]))
     return selected
-
-
-def palette(config: dict, section: dict, selected: list[tuple[str, int, int]]) -> dict:
-    base = config.get("palettes", {}).get(section.get("palette", ""), {})
-    result = {"background": base.get("background", "#ffffff")}
-    for name, _, _ in selected:
-        value = {"color": "#000000", "alpha": 1.0}
-        value.update(base.get("layers", {}).get(name, {}))
-        value.update(section.get("colors", {}).get(name, {}))
-        result[name] = {"color": str(value.get("color", "#000000")),
-                        "alpha": float(value.get("alpha", 1.0))}
-    return result
