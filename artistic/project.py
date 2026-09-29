@@ -128,6 +128,17 @@ class Project:
                 value = values.get(key)
                 if value and value not in ("design", "logo"):
                     values[key] = str(_resolve(project.parent, value))
+        outlines = config.get("render", {}).get("outlines", {})
+        if not isinstance(outlines, dict):
+            raise ProjectError("[render.outlines] must be a table")
+        if "def" in outlines:
+            outlines["def"] = str(_resolve(project.parent, outlines["def"]))
+        if "lef_files" in outlines:
+            if not isinstance(outlines["lef_files"], list) or any(
+                    not isinstance(value, str) for value in outlines["lef_files"]):
+                raise ProjectError("[render.outlines].lef_files must be a list of paths or globs")
+            outlines["lef_files"] = [str(_resolve(project.parent, value))
+                                     for value in outlines["lef_files"]]
         config["_project"] = str(project)
         config["_root"] = str(project.parent)
         return cls(project, config)
@@ -165,6 +176,10 @@ class Project:
     def generate_map(self, technology: str | os.PathLike[str] | None = None) -> Path:
         from .render import generate
         return generate(self.config, technology, section="map")
+
+    def annotate_render(self) -> list[Path]:
+        from .outlines import annotate
+        return annotate(self.config)
 
     def build_map(self) -> Path:
         from .map import build

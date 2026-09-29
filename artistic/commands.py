@@ -17,7 +17,7 @@ def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(prog="artistic", description="ArtistIC project flow")
     groups = command.add_subparsers(dest="group")
     for group, stages in {"logo": ("prepare", "merge"),
-                          "render": ("generate", "compose"),
+                          "render": ("generate", "compose", "annotate"),
                           "map": ("generate", "build")}.items():
         sub = groups.add_parser(group, help=f"{group} stages")
         stages_parser = sub.add_subparsers(dest="stage")
@@ -48,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
             print(project.merge_logo(technology))
         elif args.group == "render" and args.stage == "generate":
             print(project.generate_render(technology))
+        elif args.group == "render" and args.stage == "annotate":
+            print(*project.annotate_render(), sep="\n")
         elif args.group == "render":
             print(*project.compose_render(), sep="\n")
         elif args.group == "map" and args.stage == "generate":
