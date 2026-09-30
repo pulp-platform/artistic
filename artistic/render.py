@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .project import (ProjectError, _project_name, filename_component, input_gds,
                       project_relative, recorded_path, sha256, work_relative, write_json)
-from .image_outputs import (_number, _pdf_modules, jpeg_image, poster_options,
+from .image_outputs import (_number, _pdf_modules, jpeg_background, jpeg_image, poster_options,
                             write_pdf, write_poster)
 from .palettes import background_rgba
 from .technology import inspect_layout, palette, selected_layers, run_pya
@@ -48,6 +48,18 @@ def generation_hash(config: dict, section: str) -> str:
                        for name in ("layers", "routing", "top_metal")}},
     }
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def composition_hash(config: dict, render_record: dict) -> str:
+    selected = [(item["name"], item["layer"], item["datatype"])
+                for item in render_record["layers"]]
+    routing = render_record.get("technology", {}).get("routing")
+    resolved = palette(config, config.get("render", {}), selected, routing=routing)
+    value = {
+        "background": background_rgba(resolved["background"]),
+        "layers": [resolved[item["name"]] for item in render_record["layers"]],
+    }
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
 def verify_raw(settings: dict) -> None:
@@ -361,9 +373,7 @@ def compose(config: dict) -> list[Path]:
     if isinstance(outlines, dict) and outlines.get("enabled", True) and "png" not in suffixes:
         suffixes.append("png")
     poster = poster_options(render["poster"]) if "poster" in render else None
-    jpeg_background = background_rgba(render.get("jpeg_background", "#ffffff"))
-    if jpeg_background[3] != 255:
-        raise ProjectError("[render].jpeg_background must be opaque")
+    jpeg_matte = jpeg_background(render)
     if "pdf" in suffixes or poster is not None:
         _pdf_modules(poster=poster is not None)
     if "pdf" in suffixes and any(size < 3 or size > 14400 for size in
@@ -454,7 +464,7 @@ def compose(config: dict) -> list[Path]:
                 with _pixel_limit(image.width * image.height):
                     write_pdf(image, target, pdf_resolution)
             elif suffix in ("jpg", "jpeg"):
-                converted = jpeg_image(image, jpeg_background[:3])
+                converted = jpeg_image(image, jpeg_matte)
                 try:
                     converted.save(target, quality=95)
                 finally:
@@ -469,10 +479,11 @@ def compose(config: dict) -> list[Path]:
                 write_poster(image, target, poster)
             outputs.append(target)
         if png_target is not None:
-            write_json(receipt, {"version": 1, "image": work_relative(config, png_target),
+            write_json(receipt, {"version": 2, "image": work_relative(config, png_target),
                                  "image_sha256": sha256(png_target),
                                  "render_record_sha256": sha256(path),
                                  "generation_sha256": settings["generation_sha256"],
+                                 "composition_sha256": composition_hash(config, settings),
                                  "source_sha256": settings["input_sha256"],
                                  "resolution": list(resolution),
                                  "viewport_um": settings.get("gds", {}).get("viewport_um")})

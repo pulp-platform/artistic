@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from artistic.image_outputs import _page_crop, poster_options
 from artistic.project import ProjectError, sha256
-from artistic.render import compose, generation_hash
+from artistic.render import compose, composition_hash, generation_hash
 
 
 class RenderOutputTests(unittest.TestCase):
@@ -77,11 +77,13 @@ class RenderOutputTests(unittest.TestCase):
             self.assertEqual(alpha.tobytes(), image.getchannel("A").tobytes())
             self.assertEqual(stream.Filter, self.pikepdf.Name("/FlateDecode"))
         receipt = json.loads((self.root / "render_output.json").read_text())
+        self.assertEqual(receipt["version"], 2)
         self.assertEqual(receipt["image"], "chip_render.png")
         self.assertEqual(receipt["image_sha256"], sha256(png))
         self.assertEqual(receipt["render_record_sha256"], sha256(self.root / "render.json"))
         self.assertEqual(receipt["generation_sha256"], self.settings["generation_sha256"])
         self.assertEqual(receipt["source_sha256"], self.settings["input_sha256"])
+        self.assertEqual(receipt["composition_sha256"], composition_hash(self.config, self.settings))
         self.assertEqual(receipt["viewport_um"], [1, 2, 12, 9])
 
     def test_jpeg_flattens_transparency_without_hidden_color(self):
@@ -175,6 +177,20 @@ class RenderOutputTests(unittest.TestCase):
         self.config["render"]["jpeg_background"] = "#000000"
         self.config["palettes"]["test"]["background"] = "#000000"
         self.assertEqual(generation_hash(self.config, "render"), digest)
+
+    def test_composition_hash_uses_resolved_png_palette_only(self):
+        baseline = composition_hash(self.config, self.settings)
+        self.config["render"].update(formats=["jpg"], jpeg_background="#123456",
+                                     page_width_cm=10, poster={"grid": [2, 2]},
+                                     outlines={"enabled": True})
+        self.assertEqual(composition_hash(self.config, self.settings), baseline)
+        self.config["palettes"]["test"]["background"] = "#00000000"
+        self.assertEqual(composition_hash(self.config, self.settings), baseline)
+        self.config["palettes"]["test"]["background"] = "#ff0000"
+        self.assertNotEqual(composition_hash(self.config, self.settings), baseline)
+        self.config["palettes"]["test"]["background"] = "transparent"
+        self.config["palettes"]["test"]["layers"]["Metal1"]["alpha"] = .5
+        self.assertNotEqual(composition_hash(self.config, self.settings), baseline)
 
     def test_pdf_failure_removes_temporary_png_and_receipt(self):
         self.config["render"]["formats"] = ["png", "pdf"]

@@ -13,9 +13,9 @@ from unittest.mock import patch
 from PIL import Image
 
 from artistic.outlines import (_canvas, _def_groups, _lef_sizes, _matches, _pixel_box,
-                               _placed_box, annotate)
+                               _options, _placed_box, annotate)
 from artistic.project import ProjectError, sha256, work_relative, write_json
-from artistic.render import generation_hash
+from artistic.render import composition_hash, generation_hash
 
 
 DEF = r"""VERSION 5.8 ;
@@ -76,12 +76,15 @@ class OutlineTests(unittest.TestCase):
                   "gds": {"viewport_um": viewport},
                   "input": work_relative(self.config, source),
                   "input_sha256": sha256(source),
-                  "generation_sha256": generation_hash(self.config, "render")}
+                  "generation_sha256": generation_hash(self.config, "render"),
+                  "layers": [{"name": "Metal1", "layer": 8, "datatype": 0}],
+                  "technology": {"routing": ["Metal1", "Metal2"]}}
         record_path = write_json(self.work / "render.json", record)
-        receipt = {"version": 1, "image": image.name,
+        receipt = {"version": 2, "image": image.name,
                    "image_sha256": sha256(image),
                    "render_record_sha256": sha256(record_path),
                    "generation_sha256": record["generation_sha256"],
+                   "composition_sha256": composition_hash(self.config, record),
                    "source_sha256": record["input_sha256"],
                    "resolution": [100, 100], "viewport_um": viewport}
         write_json(self.work / "render_output.json", receipt)
@@ -102,6 +105,16 @@ class OutlineTests(unittest.TestCase):
                     "FE": (0, 0, 4, 10), "FW": (0, 0, 4, 10)}
         for orientation, box in expected.items():
             self.assertEqual(_placed_box(0, 0, 10, 4, orientation), box)
+
+    def test_recursive_lef_pattern_resolves_macro_dimensions(self):
+        deep = self.root / "libraries" / "cells" / "macros"
+        deep.mkdir(parents=True)
+        (deep / "macro.lef").write_text(LEF)
+        self.config["render"]["outlines"]["lef_files"] = ["libraries/**/*.lef"]
+        _, def_file, lef_files, modules, _ = _options(self.config)
+        self.assertEqual(lef_files, [deep / "macro.lef"])
+        groups = _def_groups(def_file, modules, _lef_sizes(lef_files))
+        self.assertEqual(groups["i_uart"][0], (60, 110, 64, 120))
 
     def test_aspect_padding_nonzero_origin_and_crop(self):
         canvas = _canvas([50, 90, 150, 140], [200, 200])
@@ -174,6 +187,84 @@ class OutlineTests(unittest.TestCase):
         self.config["render"]["outlines"]["min_area_pixels"] = -1
         with self.assertRaisesRegex(ProjectError, "min_area_pixels"):
             annotate(self.config)
+
+    def test_non_object_records_are_rejected(self):
+        for filename in ("render.json", "render_output.json"):
+            for value in ([], None, "invalid", 42):
+                with self.subTest(filename=filename, value=value):
+                    self._render_receipt()
+                    write_json(self.work / filename, value)
+                    with self.assertRaisesRegex(ProjectError, "receipt is invalid; compose render again"):
+                        annotate(self.config)
+
+    def test_receipt_version_and_composition_changes(self):
+        self._render_receipt()
+        receipt_path = self.work / "render_output.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["version"] = 1
+        write_json(receipt_path, receipt)
+        with self.assertRaisesRegex(ProjectError, "run render compose again"):
+            annotate(self.config)
+        receipt["version"] = 2
+        write_json(receipt_path, receipt)
+        render = self.config["render"]
+        self.config["palettes"] = {"custom": {"background": "white", "layers": {
+            "Metal1": {"color": "#123456", "alpha": .8}}}}
+        render["palette"] = "custom"
+        for change in (
+            lambda: self.config["palettes"]["custom"]["layers"]["Metal1"].update(color="#ff0000"),
+            lambda: self.config["palettes"]["custom"]["layers"]["Metal1"].update(alpha=.5),
+            lambda: self.config["palettes"]["custom"].update(background="black"),
+            lambda: self.config["palettes"]["custom"].update(hue_rotation_deg=20),
+            lambda: render.update(colors={"Metal1": {"color": "#00ff00"}}),
+        ):
+            self._render_receipt()
+            change()
+            with self.assertRaisesRegex(ProjectError, "run render compose again"):
+                annotate(self.config)
+        custom = self.config["palettes"]["custom"]
+        custom["layers"] = {}
+        custom["generate"] = {"hue_start_deg": 0}
+        render.pop("colors", None)
+        self._render_receipt()
+        custom["generate"]["hue_start_deg"] = 30
+        with self.assertRaisesRegex(ProjectError, "run render compose again"):
+            annotate(self.config)
+        self._render_receipt()
+        render["formats"] = ["jpg"]
+        render["jpeg_background"] = "#123456"
+        render["page_width_cm"] = 8
+        render["poster"] = {"grid": [2, 2]}
+        render["outlines"]["font_size"] = 10
+        with patch("artistic.outlines._trace", return_value=ET.Element(
+                "{http://www.w3.org/2000/svg}svg", {"viewBox": "0 0 50 50"})):
+            self.assertEqual(annotate(self.config), [self.work / "chip_modules.svg"])
+
+    def test_jpg_export_uses_configured_matte_and_validates_first(self):
+        self._render_receipt()
+        outlines = self.config["render"]["outlines"]
+        outlines["formats"] = ["jpg"]
+        self.config["render"]["jpeg_background"] = "transparent"
+        with self.assertRaisesRegex(ProjectError, "opaque"):
+            annotate(self.config)
+        self.assertFalse((self.work / "chip_modules.svg").exists())
+        self.config["render"]["jpeg_background"] = "#00ff00"
+        outlines["background_opacity"] = .5
+
+        def export(command):
+            target = Path(command[-1])
+            Image.new("RGBA", (100, 100), (255, 0, 0, 128)).save(target)
+
+        with patch("artistic.outlines._trace", return_value=ET.Element(
+                "{http://www.w3.org/2000/svg}svg", {"viewBox": "0 0 50 50"})), \
+                patch("artistic.outlines.tool", return_value="inkscape"), \
+                patch("artistic.outlines.run_checked", side_effect=export):
+            jpg = annotate(self.config)[0]
+        with Image.open(jpg) as result:
+            red, green, blue = result.getpixel((50, 50))
+            self.assertAlmostEqual(red, 128, delta=8)
+            self.assertAlmostEqual(green, 127, delta=8)
+            self.assertLess(blue, 8)
 
 
 if __name__ == "__main__":

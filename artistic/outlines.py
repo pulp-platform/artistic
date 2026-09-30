@@ -21,9 +21,10 @@ from pathlib import Path
 
 from PIL import Image, ImageColor, ImageDraw
 
+from .image_outputs import jpeg_background, jpeg_image
 from .project import (ProjectError, _project_name, filename_component, input_gds,
                       recorded_path, run_checked, sha256, tool, work_relative)
-from .render import _pixel_limit, generation_hash
+from .render import _pixel_limit, composition_hash, generation_hash
 
 
 SVG = "http://www.w3.org/2000/svg"
@@ -154,7 +155,7 @@ def _options(config: dict) -> tuple[dict, Path, list[Path], dict, list[str]]:
         raise ProjectError("[render.outlines].lef_files must be a list of paths or globs")
     for value in lef_patterns:
         pattern = str(_project_path(config, value))
-        matches = sorted(glob.glob(pattern))
+        matches = sorted(glob.glob(pattern, recursive=True))
         if not matches:
             raise ProjectError(f"outline LEF pattern matched no files: {value}")
         lef_files.extend(Path(match) for match in matches)
@@ -199,12 +200,15 @@ def _receipt(config: dict) -> tuple[Path, list[int], list[float]]:
         raise ProjectError("render output receipt missing; run render generate and compose first")
     try:
         record, receipt = json.loads(record_path.read_text()), json.loads(receipt_path.read_text())
+        if not isinstance(record, dict) or not isinstance(receipt, dict):
+            raise TypeError("render record and receipt must be JSON objects")
+        if receipt.get("version") != 2:
+            raise ProjectError("render output receipt is outdated; run render compose again")
         image = recorded_path(config, receipt["image"])
         source = input_gds(config, "render")
         viewport = [float(v) for v in record["gds"]["viewport_um"]]
         resolution = [int(v) for v in record["resolution"]]
-        valid = (receipt.get("version") == 1 and
-                 record.get("record_version") == 2 and
+        valid = (record.get("record_version") == 2 and
                  record.get("chip") == _project_name(config) and
                  image.is_relative_to(work.resolve()) and image.suffix.lower() == ".png" and
                  image.is_file() and sha256(image) == receipt.get("image_sha256") and
@@ -222,6 +226,8 @@ def _receipt(config: dict) -> tuple[Path, list[int], list[float]]:
         raise ProjectError("render output receipt is invalid; compose render again") from exc
     if not valid:
         raise ProjectError("render output is stale or changed; generate and compose render again")
+    if receipt.get("composition_sha256") != composition_hash(config, record):
+        raise ProjectError("render composition settings changed; run render compose again")
     with _pixel_limit(resolution[0] * resolution[1]):
         with Image.open(image) as background:
             if background.size != tuple(resolution):
@@ -252,6 +258,7 @@ def annotate(config: dict) -> list[Path]:
     """Annotate a verified composed render without re-rendering its GDS."""
     settings, def_file, lef_files, modules, formats = _options(config)
     image, resolution, viewport = _receipt(config)
+    jpeg_matte = jpeg_background(config.get("render", {})) if "jpg" in formats else None
     groups = _def_groups(def_file, modules, _lef_sizes(lef_files))
     width, height = resolution
     canvas = _canvas(viewport, resolution)
@@ -337,11 +344,14 @@ def annotate(config: dict) -> list[Path]:
                         if rendered.size != (width, height):
                             raise ProjectError("annotated PNG dimensions differ from render record")
                         rgba = rendered.convert("RGBA")
-                        flattened = Image.new("RGB", rgba.size, "white")
-                        flattened.paste(rgba, mask=rgba.getchannel("A"))
-                        flattened.save(target, quality=95)
-                        flattened.close()
-                        rgba.close()
+                        try:
+                            flattened = jpeg_image(rgba, jpeg_matte)
+                            try:
+                                flattened.save(target, quality=95)
+                            finally:
+                                flattened.close()
+                        finally:
+                            rgba.close()
                 outputs.append(target)
                 if "png" not in formats:
                     png.unlink()

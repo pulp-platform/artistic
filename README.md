@@ -89,7 +89,8 @@ host stages and can be changed without rerunning KLayout.
 Logo masks use complete `feature_um` squares. `[logo].dither` can be
 `"threshold"` (the default for line artwork), `"floyd-steinberg"` (photographs
 and smooth shading), or `"ordered"` (a repeating dot pattern). `threshold = 0.5`
-sets the threshold cutoff, and `contrast = 1.0` leaves contrast unchanged.
+sets the cutoff in threshold mode only; `contrast = 1.0` leaves contrast
+unchanged in all modes.
 Transparent artwork is flattened onto white before processing. Changing these
 settings requires `logo-prepare` and `logo-merge` again.
 
@@ -167,9 +168,13 @@ i_core = { label = "Core", color = "#fb120d" }
 Module keys select instance groups. `resolution` limits the raster used to
 trace outlines: a coarse grid groups nearby cells into module regions.
 `min_area_pixels` removes smaller isolated regions from that tracing grid.
-Font and stroke sizes are output-image pixels. LEFs supply
-macro sizes. Annotation follows the render viewport and rejects a stale or
-modified composed image. Composition retains a PNG for the SVG background
+Font and stroke sizes are output-image pixels. LEFs supply macro sizes;
+`**` in a LEF glob searches nested directories. Annotation follows the render
+viewport and rejects a stale or modified composed image. After changing
+palette colors or the background, rerun `render-compose` before annotation;
+changing outline settings alone does not require recomposition.
+Annotated JPEGs use the same `render.jpeg_background` as regular JPEGs.
+Composition retains a PNG for the SVG background
 even when PNG is not in `render.formats`; keep it alongside the SVG. Annotation
 is optional and is not included in `make all`.
 
