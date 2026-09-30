@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .project import ProjectError
+from .palettes import background_rgba
 
 
 def _pdf_modules(poster: bool = False):
@@ -98,6 +99,13 @@ def jpeg_image(image, background: tuple[int, int, int]):
     result = flat.convert("RGB")
     flat.close()
     return result
+
+
+def jpeg_background(render: dict) -> tuple[int, int, int]:
+    rgba = background_rgba(render.get("jpeg_background", "#ffffff"))
+    if rgba[3] != 255:
+        raise ProjectError("[render].jpeg_background must be opaque")
+    return rgba[:3]
 
 
 def write_pdf(image, target: Path, dpi: float) -> None:
