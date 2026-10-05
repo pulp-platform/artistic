@@ -78,7 +78,8 @@ def _safe_output(config: dict, raw_dir: Path | None = None) -> Path:
     chip = _project_name(config) if config.get("design", {}).get("gds") else ""
     if chip:
         protected.extend(work / f"{chip}_{suffix}" for suffix in (
-            "logo_mono.png", "logo.svg", "logo_render.png", "logo.gds", "chip.gds.gz",
+            "logo_mono.png", "logo.svg", "logo_geometry.svg", "logo_render.png", "logo.gds", "chip.gds.gz",
+            "palette.svg",
             "poster.pdf", "modules.svg", "modules.png", "modules.pdf", "modules.jpg"))
         protected.extend(work / f"{chip}_render.{fmt}"
                          for fmt in ("png", "jpg", "jpeg", "pdf"))
