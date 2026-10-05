@@ -253,8 +253,10 @@ def build(config: dict) -> Path:
 
 def _viewer(metadata: dict) -> str:
     return """<!doctype html><meta charset="utf-8"><title>ArtistIC map</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<div id="map" style="height:100vh"></div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+ integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<div id="map" style="height:100vh"></div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+ integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <script>const names=%s,maxZoom=%d,map=L.map('map',{crs:L.CRS.Simple,minZoom:0,maxZoom});
 const bounds=L.latLngBounds(map.unproject([0,%s],maxZoom),map.unproject([%s,0],maxZoom));
 const layers=Object.fromEntries(names.map(n=>[n,L.tileLayer(`${n}/{z}/{x}/{y}.png`,{tileSize:%d,noWrap:true,bounds,maxNativeZoom:maxZoom})]));

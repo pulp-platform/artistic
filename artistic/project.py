@@ -154,7 +154,66 @@ class Project:
 
     def inspect(self, technology: str | os.PathLike[str] | None = None) -> dict:
         from .technology import inspect_layout
+        from .inspection import analyze, write_palette_preview
         manifest = inspect_layout(self.config, technology)
+        layouts = {"render": {}, "map": {}}
+        section_gds = {}
+        geometry_source = {}
+        design_gds = Path(self.config["design"]["gds"]).resolve()
+        inspected = {design_gds: manifest["layout"]}
+        logo_gds = self.work_dir / f"{self.name}_chip.gds.gz"
+        merge_record = self.work_dir / "logo_merge.json"
+        logo_requested = any(self.config.get(section, {}).get("input", "design") == "logo"
+                             for section in ("render", "map"))
+        logo_source = None
+        resolved_layer = None
+        if logo_requested or merge_record.is_file():
+            logo_config = dict(self.config)
+            logo_config["render"] = {**self.config.get("render", {}), "input": "logo"}
+            try:
+                logo_source = input_gds(logo_config, "render")
+            except ProjectError:
+                logo_source = None
+            else:
+                try:
+                    record = json.loads(merge_record.read_text())
+                except (OSError, ValueError):
+                    record = None
+                candidate = record.get("resolved_layer") if isinstance(record, dict) else None
+                if (isinstance(candidate, dict) and isinstance(candidate.get("name"), str) and
+                        isinstance(candidate.get("layer"), int) and
+                        not isinstance(candidate.get("layer"), bool) and
+                        isinstance(candidate.get("datatype"), int) and
+                        not isinstance(candidate.get("datatype"), bool)):
+                    resolved_layer = candidate
+        for section in ("render", "map"):
+            configured_input = self.config.get(section, {}).get("input", "design")
+            if configured_input == "logo" and logo_source is None:
+                source = design_gds
+                source_layout = manifest["layout"]
+                geometry_source[section] = (
+                    "estimate (logo GDS is stale; prepare and merge required)" if logo_gds.is_file()
+                    else "estimate (logo GDS not prepared)")
+                layouts[section] = source_layout
+                section_gds[section] = str(source)
+                continue
+            source = logo_source if configured_input == "logo" else input_gds(self.config, section)
+            source_layout = inspected.get(source)
+            if source_layout is None:
+                source_layout = inspect_layout(self.config, technology, source)["layout"]
+                inspected[source] = source_layout
+            geometry_source[section] = "inspected"
+            layouts[section] = source_layout
+            section_gds[section] = str(source)
+        manifest["section_layouts"] = layouts
+        manifest["section_gds"] = section_gds
+        manifest["geometry_source"] = geometry_source
+        manifest = analyze(self.config, manifest)
+        manifest["palette_preview"] = work_relative(
+            self.config, write_palette_preview(self.config, manifest))
+        manifest.pop("section_layouts", None)
+        if resolved_layer is not None:
+            manifest.setdefault("logo", {})["resolved_layer"] = resolved_layer
         write_json(self.work_dir / "manifest.json", manifest)
         return manifest
 

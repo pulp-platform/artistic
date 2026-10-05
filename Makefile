@@ -9,6 +9,7 @@ ARTISTIC ?= ./bin/artistic
         map-generate map-build map
 
 all:
+	$(MAKE) inspect
 	$(MAKE) logo
 	$(MAKE) render
 	$(MAKE) map
@@ -30,6 +31,7 @@ render-annotate:
 render:
 	$(MAKE) render-generate
 	$(MAKE) render-compose
+	$(ARTISTIC) render annotate $(PROJECT) --if-configured
 map-generate:
 	$(ARTISTIC) map generate $(PROJECT)
 map-build:
