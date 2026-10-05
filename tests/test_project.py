@@ -370,7 +370,7 @@ lef_files = ["../lef/*.lef"]
                                  (128, 128, 128, 255)))
                 artwork.save(source)
             config = {"design": {"name": "chip", "work_dir": str(root)},
-                      "logo": {"source": str(source), "width_um": 3,
+                      "logo": {"source": str(source), "width_um": 7,
                                "height_um": 1, "feature_um": 1}}
             with patch("artistic.logo.tool", side_effect=AssertionError("external tool")):
                 output = prepare_logo(config)
@@ -380,7 +380,7 @@ lef_files = ["../lef/*.lef"]
             record = json.loads((root / "logo_prepare.json").read_text())
             self.assertEqual(record["mask_sha256"], sha256(output))
 
-            config["logo"]["width_um"] = 6
+            config["logo"]["width_um"] = 16
             output = prepare_logo(config)
             with Image.open(output) as mask:
                 self.assertEqual(mask.size, (6, 1))
@@ -398,8 +398,8 @@ lef_files = ["../lef/*.lef"]
             config = {"_root": str(root),
                       "design": {"name": "chip", "work_dir": str(root),
                                  "repository": "example/repo"},
-                      "logo": {"source": str(source), "width_um": 2,
-                               "height_um": 2, "feature_um": 1}}
+                      "logo": {"source": str(source), "width_um": 4,
+                               "height_um": 4, "feature_um": 1}}
             def rasterize(command):
                 self.assertEqual(command[0], "inkscape")
                 self.assertIn("--export-width=2", command)

@@ -11,8 +11,11 @@ errors are explicit and the host-side stages remain ordinary Python.
 """
 
 import json
+import math
 import os
 import sys
+import xml.etree.ElementTree as ET
+from decimal import Decimal, ROUND_CEILING
 
 import pya
 
@@ -22,6 +25,35 @@ import pya
 # execution.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from logo_geometry import box_is_inside, select_pixel_boxes
+
+
+def _positive_um(request, key, default=None):
+    value = float(request.get(key, default))
+    if not math.isfinite(value) or value <= 0:
+        raise RuntimeError("logo %s must be a finite positive number" % key)
+    return value
+
+
+def _ceil_dbu(value, dbu):
+    # Decimal division avoids rounding an exact grid value up spuriously while
+    # never rounding a requested minimum width or spacing down.
+    return int((Decimal(str(value)) / Decimal(str(dbu))).to_integral_value(
+        rounding=ROUND_CEILING))
+
+
+def _write_logo_svg(path, boxes, bbox, dbu):
+    left, bottom, right, top = bbox
+    width, height = (right - left) * dbu, (top - bottom) * dbu
+    svg = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg",
+                             "width": "%smm" % (width / 1000),
+                             "height": "%smm" % (height / 1000),
+                             "viewBox": "0 0 %s %s" % (width, height)})
+    for xl, yb, xr, yt in boxes:
+        ET.SubElement(svg, "rect", {"x": str((xl - left) * dbu),
+                                  "y": str((top - yt) * dbu),
+                                  "width": str((xr - xl) * dbu),
+                                  "height": str((yt - yb) * dbu), "fill": "black"})
+    ET.ElementTree(svg).write(path, encoding="utf-8", xml_declaration=True)
 
 
 def _layer_index(layout, layer, datatype):
@@ -86,16 +118,39 @@ def logo_merge(request):
     # hierarchy ambiguity: the generated logo is a flat set of polygons.
     metal = pya.Region(original.begin_shapes_rec(source_index))
     logo_region = pya.Region()
-    feature = float(request["feature_um"]) / layout.dbu
+    feature_um = _positive_um(request, "feature_um")
+    spacing_um = _positive_um(request, "spacing_um", 2.0)
+    minimum_pitch = Decimal(str(feature_um)) + Decimal(str(spacing_um))
+    pitch_um = _positive_um(request, "pitch_um", float(minimum_pitch))
+    if Decimal(str(pitch_um)) < minimum_pitch:
+        raise RuntimeError("logo pitch_um must be at least feature_um + spacing_um")
+    feature = _ceil_dbu(feature_um, layout.dbu)
+    spacing = _ceil_dbu(spacing_um, layout.dbu)
+    pitch = max(_ceil_dbu(pitch_um, layout.dbu), feature + spacing)
+    if request.get("max_feature_um") is not None:
+        maximum = _positive_um(request, "max_feature_um")
+        if Decimal(feature) * Decimal(str(layout.dbu)) > Decimal(str(maximum)):
+            raise RuntimeError("logo feature exceeds max_feature_um after database-unit rounding")
     width_px = int(request["width_px"])
     height_px = int(request["height_px"])
+    for dimension, count in (("width_um", width_px), ("height_um", height_px)):
+        requested_extent = _positive_um(
+            request, dimension, float(Decimal(count - 1) * Decimal(str(pitch_um)) +
+                                      Decimal(str(feature_um))))
+        actual_extent = Decimal((count - 1) * pitch + feature) * Decimal(str(layout.dbu))
+        if actual_extent > Decimal(str(requested_extent)):
+            raise RuntimeError(
+                "logo array %s after database-unit rounding exceeds requested %s=%s um; "
+                "increase %s to at least %s um or choose database-unit-representable "
+                "feature_um, spacing_um, and pitch_um, then run logo prepare again" %
+                (dimension, dimension, requested_extent, dimension, actual_extent))
     offset_x = float(request.get("offset_x_um", 0.0)) / layout.dbu
     offset_y = float(request.get("offset_y_um", 0.0)) / layout.dbu
-    # Existing top metal is a keepout for the artwork.  Expand it by one
-    # feature so adjacent polygons do not create sub-resolution slivers.  Each
-    # requested artwork pixel is tested independently and either inserted as a
-    # complete feature-sized rectangle or rejected in its entirety.
-    keepout = metal.sized(max(1, int(round(feature))))
+    if not math.isfinite(offset_x) or not math.isfinite(offset_y):
+        raise RuntimeError("logo offsets must be finite numbers")
+    # Reject whole artwork pixels against a conservatively expanded metal
+    # keepout.  Exact spacing is allowed, but overlap is never clipped away.
+    keepout = metal.sized(spacing)
 
     def is_blocked(box):
         if not box_is_inside(box, request["bbox_dbu"]):
@@ -104,9 +159,10 @@ def logo_merge(request):
         # directly, avoiding a full boolean Region operation for every pixel.
         return not keepout.overlapping(pya.Box(*box)).is_empty()
 
-    for box in select_pixel_boxes(
+    boxes = select_pixel_boxes(
             request["rows"], width_px, height_px, request["bbox_dbu"],
-            feature, is_blocked, offset_x, offset_y):
+            feature, is_blocked, offset_x, offset_y, pitch)
+    for box in boxes:
         logo_region.insert(pya.Box(*box))
     if logo_region.is_empty():
         raise RuntimeError("logo mask is fully blocked by selected metal")
@@ -118,6 +174,10 @@ def logo_merge(request):
     logo_cell = logo_layout.create_cell(request["logo_cell"])
     logo_cell.shapes(logo_index).insert(logo_region)
     logo_layout.write(request["logo_gds"])
+    logo_bbox = [logo_region.bbox().left, logo_region.bbox().bottom,
+                 logo_region.bbox().right, logo_region.bbox().top]
+    svg_path = request.get("logo_svg", os.path.splitext(request["logo_gds"])[0] + "_geometry.svg")
+    _write_logo_svg(svg_path, boxes, logo_bbox, layout.dbu)
 
     # The chip GDS has one explicit top cell containing the original design and
     # the logo.  Keeping the original cell intact makes downstream hierarchy
@@ -139,9 +199,22 @@ def logo_merge(request):
     layout.write(request["chip_gds"])
     os.makedirs(os.path.dirname(os.path.abspath(request["result"])), exist_ok=True)
     with open(request["result"], "w") as stream:
-        json.dump({"logo_shapes": logo_region.size(), "logo_bbox_dbu":
-                   [logo_region.bbox().left, logo_region.bbox().bottom,
-                    logo_region.bbox().right, logo_region.bbox().top]}, stream)
+        requested = sum(end - start for row in request["rows"] for start, end in row["runs"])
+        canvas_area = ((width_px - 1) * pitch + feature) * ((height_px - 1) * pitch + feature)
+        area = logo_region.area()
+        json.dump({"logo_shapes": logo_region.size(), "logo_bbox_dbu": logo_bbox,
+                   "requested_pixels": requested, "accepted_pixels": len(boxes),
+                   "rejected_pixels": requested - len(boxes),
+                   "logo_area_um2": area * layout.dbu ** 2,
+                   "canvas_area_um2": canvas_area * layout.dbu ** 2,
+                   "canvas_width_um": ((width_px - 1) * pitch + feature) * layout.dbu,
+                   "canvas_height_um": ((height_px - 1) * pitch + feature) * layout.dbu,
+                   "logo_density": area / canvas_area,
+                   "requested_feature_um": feature_um,
+                   "requested_spacing_um": spacing_um, "requested_pitch_um": pitch_um,
+                   "feature_um": feature * layout.dbu,
+                   "spacing_um": spacing * layout.dbu, "pitch_um": pitch * layout.dbu,
+                   "logo_svg": os.path.abspath(svg_path)}, stream, indent=2, sort_keys=True)
 
 
 def render(request):

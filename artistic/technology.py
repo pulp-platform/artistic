@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -216,8 +217,9 @@ def inspect_layout(config: dict, technology: str | os.PathLike[str] | None = Non
     layout["top_metal"] = tech["top_metal"]
     return {"project": config.get("_project"), "gds": str(source),
             "work_dir": config["design"]["work_dir"], "technology": tech,
-            "layout": layout, "logo": config.get("logo", {}),
-            "render": config.get("render", {}), "map": config.get("map", {})}
+            "layout": layout, "logo": copy.deepcopy(config.get("logo", {})),
+            "render": copy.deepcopy(config.get("render", {})),
+            "map": copy.deepcopy(config.get("map", {}))}
 
 
 def layer(value: object, tech: dict) -> tuple[str, int, int]:

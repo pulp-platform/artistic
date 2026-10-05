@@ -73,7 +73,8 @@ def input_gds(config: dict, section: str) -> Path:
     if value == "design":
         source = Path(config["design"]["gds"])
     elif value == "logo":
-        source = Path(config["design"]["work_dir"]) / f"{_project_name(config)}_chip.gds.gz"
+        from .logo import validate_merged
+        source = validate_merged(config)
     else:
         source = Path(value)
     if not source.is_file():

@@ -60,6 +60,8 @@ source = "art/logo.png"
 width_um = 0.2
 height_um = 0.2
 feature_um = 0.1
+spacing_um = 0.1
+pitch_um = 0.2
 layer = "Metal1"
 [render]
 input = "source/custom.gds"
