@@ -10,18 +10,22 @@ from __future__ import annotations
 
 import colorsys
 import glob
+import gzip
+import hashlib
 import json
 import math
 import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
+from array import array
 from collections import defaultdict
 from pathlib import Path
 
 from PIL import Image, ImageColor, ImageDraw
 
 from .image_outputs import jpeg_background, jpeg_image
+from .palettes import background_rgba, palette
 from .project import (ProjectError, _project_name, filename_component, input_gds,
                       recorded_path, run_checked, sha256, tool, work_relative)
 from .render import _pixel_limit, composition_hash, generation_hash
@@ -62,21 +66,25 @@ def _placed_box(x: float, y: float, width: float, height: float,
     return x, y, x + width, y + height
 
 
+def _components(value: str) -> list[str]:
+    value = value.lstrip("\\").replace(r"\[", "[").replace(r"\]", "]")
+    return re.split(r"[./]", value)
+
+
 def _matches(pattern: str, instance: str) -> bool:
     # Match complete hierarchy components. DEF bus indices may follow a component.
-    def components(value: str) -> list[str]:
-        value = value.lstrip("\\").replace(r"\[", "[").replace(r"\]", "]")
-        return re.split(r"[./]", value)
-
-    wanted = components(pattern)
-    actual = components(instance)
+    wanted = _components(pattern)
+    actual = _components(instance)
     return any(all(a == p or a.startswith(p + "[") for a, p in zip(actual[i:], wanted))
                for i in range(len(actual) - len(wanted) + 1))
 
 
-def _def_groups(path: Path, modules: dict, lef_sizes: dict[str, tuple[float, float]]
-                ) -> dict[str, list[tuple[float, float, float, float]]]:
-    data = path.read_text()
+def _def_placements(path: Path, lef_sizes: dict[str, tuple[float, float]]) -> list:
+    if path.suffix.lower() == ".gz":
+        with gzip.open(path, "rt") as source:
+            data = source.read()
+    else:
+        data = path.read_text()
     units = re.search(r"\bUNITS\s+DISTANCE\s+MICRONS\s+(\d+)\s*;", data, re.I)
     if not units or int(units[1]) <= 0:
         raise ProjectError(f"DEF units missing or invalid: {path}")
@@ -92,7 +100,7 @@ def _def_groups(path: Path, modules: dict, lef_sizes: dict[str, tuple[float, flo
                         data, re.I | re.S)
     if not section:
         raise ProjectError(f"DEF COMPONENTS section missing: {path}")
-    groups = defaultdict(list)
+    placements = []
     for statement in section[1].split(";"):
         component = re.search(r"(?:^|\s)-\s+(\S+)\s+(\S+)", statement)
         if not component:
@@ -105,10 +113,56 @@ def _def_groups(path: Path, modules: dict, lef_sizes: dict[str, tuple[float, flo
         x, y = int(placement[1]) / dbu, int(placement[2]) / dbu
         width, height = lef_sizes.get(master, (0.0, 0.0))
         box = _placed_box(x, y, width, height, placement[3].upper())
+        placements.append((name, box))
+    return placements
+
+
+def _group_placements(placements: list, modules: dict, rooted: set | None = None) -> dict:
+    groups = defaultdict(list)
+    prefixes = {pattern: _components(pattern) for pattern in rooted or ()}
+    for name, box in placements:
+        actual = _components(name)
         for pattern in modules:
-            if _matches(pattern, name):
+            matches = (actual[:len(prefixes[pattern])] == prefixes[pattern]
+                       if pattern in prefixes else _matches(pattern, name))
+            if matches:
                 groups[pattern].append(box)
     return groups
+
+
+def _def_groups(path: Path, modules: dict, lef_sizes: dict[str, tuple[float, float]]
+                ) -> dict[str, list[tuple[float, float, float, float]]]:
+    return _group_placements(_def_placements(path, lef_sizes), modules)
+
+
+def _hierarchy_modules(placements: list, hierarchy: dict, explicit: dict) -> tuple[dict, set]:
+    top = _components(hierarchy["top_instance"])
+    prefixes = set()
+    found_top = False
+    for name, _ in placements:
+        parts = _components(name)
+        if parts[:len(top)] != top or len(parts) <= len(top):
+            continue
+        found_top = True
+        # The final DEF component is a placed leaf, not a hierarchy instance.
+        for depth in range(hierarchy.get("min_depth", 1),
+                           min(hierarchy.get("max_depth", 1), len(parts) - len(top) - 1) + 1):
+            if len(top) + depth < len(parts):
+                prefixes.add("/".join(parts[:len(top) + depth]))
+    if not found_top:
+        raise ProjectError(f"outline hierarchy top_instance not found: {hierarchy['top_instance']}")
+    modules, overridden = {}, set()
+    for prefix in sorted(prefixes):
+        hue = int.from_bytes(hashlib.sha256(prefix.encode()).digest()[:4], "big") / 2**32
+        color = "#" + "".join(f"{round(channel * 255):02x}" for channel in
+                              colorsys.hls_to_rgb(hue, .48, .65))
+        modules[prefix] = {"label": prefix.removeprefix("/".join(top) + "/"), "color": color}
+        for pattern, spec in explicit.items():
+            if _matches(pattern, prefix):
+                modules[prefix] = spec
+                overridden.add(pattern)
+    modules.update({pattern: spec for pattern, spec in explicit.items() if pattern not in overridden})
+    return modules, prefixes
 
 
 def _canvas(viewport: list[float], resolution: list[int]) -> tuple[float, float, float, float]:
@@ -159,13 +213,29 @@ def _options(config: dict) -> tuple[dict, Path, list[Path], dict, list[str]]:
         if not matches:
             raise ProjectError(f"outline LEF pattern matched no files: {value}")
         lef_files.extend(Path(match) for match in matches)
-    modules = settings.get("modules")
-    if not isinstance(modules, dict) or not modules:
-        raise ProjectError("[render.outlines.modules] must contain at least one module")
+    modules = settings.get("modules", {})
+    hierarchy = settings.get("hierarchy")
+    if not isinstance(modules, dict) or (not modules and hierarchy is None):
+        raise ProjectError("configure [render.outlines.modules] or [render.outlines.hierarchy]")
+    if hierarchy is not None:
+        if not isinstance(hierarchy, dict):
+            raise ProjectError("[render.outlines.hierarchy] must be a table")
+        top = hierarchy.get("top_instance")
+        if (not isinstance(top, str) or not top or
+                any(not part or re.search(r"[\s*?]", part) for part in _components(top))):
+            raise ProjectError("[render.outlines.hierarchy].top_instance must be a hierarchy prefix")
+        minimum, maximum = hierarchy.get("min_depth", 1), hierarchy.get("max_depth", 1)
+        if type(minimum) is not int or type(maximum) is not int or not 1 <= minimum <= maximum:
+            raise ProjectError("outline hierarchy depths must be positive integers with min_depth <= max_depth")
+    if "background" in settings:
+        background_rgba(settings["background"])
     for pattern, spec in modules.items():
         if not isinstance(pattern, str) or not pattern or not isinstance(spec, dict):
             raise ProjectError("invalid [render.outlines.modules] entry")
-        filename_component(str(spec.get("label", "")), f"outline label for {pattern}")
+        label = spec.get("label")
+        if (not isinstance(label, str) or not label.strip() or
+                any(ord(char) < 32 for char in label)):
+            raise ProjectError(f"outline label for {pattern} must be nonempty text without control characters")
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(spec.get("color", ""))):
             raise ProjectError(f"outline color for {pattern} must be #RRGGBB")
     resolution = settings.get("resolution", 200)
@@ -242,6 +312,20 @@ def _label_color(color: str, lightness: float) -> str:
     return "#" + "".join(f"{round(255 * v):02x}" for v in adjusted)
 
 
+def _trace_raster(mask: Image.Image, path: Path, min_area_pixels: int) -> Path:
+    bitmap = path.with_suffix(".bmp")
+    mask.save(bitmap)
+    try:
+        # PGM uses the same traced curves and hole semantics as the SVG backend.
+        sx, sy = (max(1.0, min(4.0, 2048 / extent)) for extent in mask.size)
+        run_checked([tool("potrace"), str(bitmap), "-b", "pgm", "-t", str(min_area_pixels),
+                     "-x", f"{sx}x{sy}",
+                     "-o", str(path.with_suffix(".pgm"))])
+    except subprocess.CalledProcessError as exc:
+        raise ProjectError(f"potrace failed for {bitmap.name}") from exc
+    return path.with_suffix(".pgm")
+
+
 def _trace(mask: Image.Image, path: Path, min_area_pixels: int) -> ET.Element:
     bitmap = path.with_suffix(".bmp")
     vector = path.with_suffix(".svg")
@@ -251,7 +335,133 @@ def _trace(mask: Image.Image, path: Path, min_area_pixels: int) -> ET.Element:
                      "-o", str(vector)])
     except subprocess.CalledProcessError as exc:
         raise ProjectError(f"potrace failed for {bitmap.name}") from exc
+    if max(mask.size) <= 512:
+        _trace_raster(mask, path, min_area_pixels)
     return ET.parse(vector).getroot()
+
+
+def _component_masks(mask: Image.Image):
+    """Yield isolated source components with holes and white tracing context."""
+    width, height = mask.size
+    with mask.convert("L") as grayscale:
+        pixels = bytearray(grayscale.tobytes())
+    for seed in range(len(pixels)):
+        if pixels[seed] != 0:
+            continue
+        pending, runs = array("I", [seed]), array("I")
+        left, top, right, bottom = width, height, 0, 0
+        while pending:
+            index = pending.pop()
+            if pixels[index] != 0:
+                continue
+            row = index // width
+            start, end = index, index + 1
+            while start > row * width and pixels[start - 1] == 0:
+                start -= 1
+            while end < (row + 1) * width and pixels[end] == 0:
+                end += 1
+            pixels[start:end] = b"\xff" * (end - start)
+            runs.extend((start, end))
+            left, right = min(left, start % width), max(right, (end - 1) % width + 1)
+            top, bottom = min(top, row), max(bottom, row + 1)
+            # Include diagonal neighbors so Potrace decides ambiguous corner connectivity.
+            for neighbor_row in (row - 1, row + 1):
+                if not 0 <= neighbor_row < height:
+                    continue
+                cursor = neighbor_row * width + max(0, start % width - 1)
+                limit = neighbor_row * width + min(width, (end - 1) % width + 2)
+                while cursor < limit:
+                    if pixels[cursor] == 0:
+                        pending.append(cursor)
+                        while cursor < limit and pixels[cursor] == 0:
+                            cursor += 1
+                    else:
+                        cursor += 1
+        padding = 2
+        crop = Image.new("1", (right - left + 2 * padding, bottom - top + 2 * padding), 1)
+        draw = ImageDraw.Draw(crop)
+        for i in range(0, len(runs), 2):
+            row, x0 = divmod(runs[i], width)
+            x1 = (runs[i + 1] - 1) % width
+            draw.line((x0 - left + padding, row - top + padding,
+                       x1 - left + padding, row - top + padding), fill=0)
+        yield crop, (left - padding, top - padding)
+
+
+def _trace_anchors(mask: Image.Image, path: Path, min_area_pixels: int) -> list:
+    if max(mask.size) <= 512:
+        with _pixel_limit(mask.width * mask.height * 16):
+            with Image.open(path.with_suffix(".pgm")) as filled:
+                return [(x * mask.width / filled.width, y * mask.height / filled.height)
+                        for x, y in _region_anchors(filled)]
+    anchors = []
+    for index, (crop, (ox, oy)) in enumerate(_component_masks(mask)):
+        try:
+            raster = _trace_raster(crop, path.with_name(f"{path.name}-region-{index:04d}"),
+                                   min_area_pixels)
+            raster_limit = (max(crop.width, min(4 * crop.width, 2048)) *
+                            max(crop.height, min(4 * crop.height, 2048)))
+            with _pixel_limit(raster_limit):
+                with Image.open(raster) as filled:
+                    anchors.extend((ox + x * crop.width / filled.width,
+                                    oy + y * crop.height / filled.height)
+                                   for x, y in _region_anchors(filled))
+        finally:
+            crop.close()
+    return anchors
+
+
+def _region_anchors(mask: Image.Image) -> list[tuple[float, float]]:
+    """Find a high-clearance interior pixel in every connected traced region."""
+    width, height = mask.size
+    stride = width + 2
+    count = stride * (height + 2)
+    distance = array("H", [0]) * count
+    pixels = mask.convert("L").tobytes()
+    for y in range(height):
+        for x in range(width):
+            if pixels[y * width + x] < 128:
+                distance[(y + 1) * stride + x + 1] = 65535
+    # A 3-4 chamfer transform approximates Euclidean boundary clearance, including holes.
+    for y in range(1, height + 1):
+        for x in range(1, width + 1):
+            i = y * stride + x
+            if distance[i]:
+                distance[i] = min(distance[i], distance[i - 1] + 3,
+                                  distance[i - stride] + 3, distance[i - stride - 1] + 4,
+                                  distance[i - stride + 1] + 4)
+    for y in range(height, 0, -1):
+        for x in range(width, 0, -1):
+            i = y * stride + x
+            if distance[i]:
+                distance[i] = min(distance[i], distance[i + 1] + 3,
+                                  distance[i + stride] + 3, distance[i + stride - 1] + 4,
+                                  distance[i + stride + 1] + 4)
+    visited, anchors = bytearray(count), []
+    for y in range(1, height + 1):
+        for x in range(1, width + 1):
+            start = y * stride + x
+            if not distance[start] or visited[start]:
+                continue
+            queue = array("I", [start])
+            visited[start] = 1
+            best, candidates, sx, sy = 0, [], 0, 0
+            for i in queue:
+                px, py = i % stride, i // stride
+                sx, sy = sx + px, sy + py
+                if distance[i] > best:
+                    best, candidates = distance[i], [i]
+                elif distance[i] == best:
+                    candidates.append(i)
+                for neighbor in (i - 1, i + 1, i - stride, i + stride):
+                    if distance[neighbor] and not visited[neighbor]:
+                        visited[neighbor] = 1
+                        queue.append(neighbor)
+            cx, cy = sx / len(queue), sy / len(queue)
+            selected = min(candidates, key=lambda i: ((i % stride - cx)**2 +
+                                                      (i // stride - cy)**2, i))
+            anchors.append((selected % stride - .5, selected // stride - .5))
+    return anchors
 
 
 def annotate(config: dict) -> list[Path]:
@@ -259,7 +469,11 @@ def annotate(config: dict) -> list[Path]:
     settings, def_file, lef_files, modules, formats = _options(config)
     image, resolution, viewport = _receipt(config)
     jpeg_matte = jpeg_background(config.get("render", {})) if "jpg" in formats else None
-    groups = _def_groups(def_file, modules, _lef_sizes(lef_files))
+    placements = _def_placements(def_file, _lef_sizes(lef_files))
+    rooted = set()
+    if settings.get("hierarchy") is not None:
+        modules, rooted = _hierarchy_modules(placements, settings["hierarchy"], modules)
+    groups = _group_placements(placements, modules, rooted)
     width, height = resolution
     canvas = _canvas(viewport, resolution)
     trace_limit = settings.get("resolution", 200)
@@ -267,6 +481,13 @@ def annotate(config: dict) -> list[Path]:
     trace_size = (max(1, round(width * scale)), max(1, round(height * scale)))
     root = ET.Element(f"{{{SVG}}}svg", {"version": "1.1", "width": str(width),
                       "height": str(height), "viewBox": f"0 0 {width} {height}"})
+    background = settings.get("background", palette(config, config.get("render", {}),
+                                                     [], routing=[])["background"])
+    red, green, blue, alpha = background_rgba(background)
+    if "background" not in settings and alpha < 255:
+        red, green, blue, alpha = 0, 0, 0, 0
+    ET.SubElement(root, f"{{{SVG}}}rect", {"width": str(width), "height": str(height),
+                  "fill": f"#{red:02x}{green:02x}{blue:02x}", "fill-opacity": str(alpha / 255)})
     ET.SubElement(root, f"{{{SVG}}}image", {f"{{{XLINK}}}href": image.name,
                   "width": str(width), "height": str(height),
                   "opacity": str(settings.get("background_opacity", 1))})
@@ -285,7 +506,8 @@ def annotate(config: dict) -> list[Path]:
                 draw.rectangle((math.floor(x0 * scale), math.floor(y0 * scale),
                                 max(math.floor(x0 * scale), math.ceil(x1 * scale) - 1),
                                 max(math.floor(y0 * scale), math.ceil(y1 * scale) - 1)), fill=0)
-            traced = _trace(mask, Path(temporary) / f"module-{index:04d}",
+            trace_path = Path(temporary) / f"module-{index:04d}"
+            traced = _trace(mask, trace_path,
                             settings.get("min_area_pixels", 50))
             viewbox = [float(v) for v in traced.attrib["viewBox"].split()]
             outer = ET.SubElement(root, f"{{{SVG}}}g", {
@@ -301,8 +523,10 @@ def annotate(config: dict) -> list[Path]:
                 path.set("stroke", spec["color"])
                 path.set("stroke-width", str(settings.get("stroke_width", 1)))
                 path.set("vector-effect", "non-scaling-stroke")
-            labels.append((spec, (min(b[0] for b in boxes) + max(b[2] for b in boxes)) / 2,
-                           (min(b[1] for b in boxes) + max(b[3] for b in boxes)) / 2))
+            if traced.find(f".//{{{SVG}}}path") is not None and float(settings.get("font_size", 14)):
+                labels.extend((spec, x * width / mask.width, y * height / mask.height)
+                              for x, y in _trace_anchors(mask, trace_path,
+                                                        settings.get("min_area_pixels", 50)))
             mask.close()
         for spec, x, y in labels:
             if float(settings.get("font_size", 14)):
