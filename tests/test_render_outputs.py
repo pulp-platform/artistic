@@ -116,6 +116,36 @@ class RenderOutputTests(unittest.TestCase):
             with self.Image.open(png) as image:
                 self.assertEqual(rgb.tobytes(), image.convert("RGB").tobytes())
 
+    def test_pdf_physical_height_and_aspect_fit_page(self):
+        for change, expected_cm, expected_image_cm in (
+                ({"page_height_cm": 5.08}, (5.08 * 11 / 7, 5.08), (5.08 * 11 / 7, 5.08)),
+                ({"page_width_cm": 5.08, "page_height_cm": 5.08},
+                 (5.08, 5.08), (5.08, 5.08 * 7 / 11)),
+                ({"page_width_cm": 5.08, "page_height_cm": 1.27},
+                 (5.08, 1.27), (1.27 * 11 / 7, 1.27))):
+            with self.subTest(change=change):
+                self.config["render"].pop("page_width_cm", None)
+                self.config["render"].pop("page_height_cm", None)
+                self.config["render"].update(change)
+                png, pdf = compose(self.config)
+                with self.Image.open(png) as image, self.pikepdf.Pdf.open(pdf) as document:
+                    self.assertEqual(image.size, (11, 7))
+                    page = document.pages[0]
+                    page_width, page_height = (float(page.MediaBox[index]) for index in (2, 3))
+                    self.assertAlmostEqual(page_width, expected_cm[0] * 72 / 2.54, places=3)
+                    self.assertAlmostEqual(page_height, expected_cm[1] * 72 / 2.54, places=3)
+                    instructions = self.pikepdf.parse_content_stream(page)
+                    matrix = next(operands for operands, operator in instructions
+                                  if str(operator) == "cm")
+                    width, height = expected_image_cm[0] * 72 / 2.54, expected_image_cm[1] * 72 / 2.54
+                    self.assertAlmostEqual(float(matrix[0]), width, places=3)
+                    self.assertAlmostEqual(float(matrix[3]), height, places=3)
+                    self.assertAlmostEqual(float(matrix[4]), (page_width - width) / 2, places=3)
+                    self.assertAlmostEqual(float(matrix[5]), (page_height - height) / 2, places=3)
+                    _, rgb, alpha = self._pdf_image(page)
+                    self.assertEqual(rgb.tobytes(), image.convert("RGB").tobytes())
+                    self.assertEqual(alpha.tobytes(), image.getchannel("A").tobytes())
+
     def test_poster_geometry_row_order_and_transparency(self):
         self.config["render"]["formats"] = ["png"]
         self.config["render"]["poster"] = {
@@ -160,6 +190,11 @@ class RenderOutputTests(unittest.TestCase):
             ({"jpeg_background": "transparent"}, "opaque"),
             ({"page_width_cm": 0}, "page_width_cm"),
             ({"page_width_cm": 0.01}, "PDF page"),
+            ({"page_height_cm": 0}, "page_height_cm"),
+            ({"page_height_cm": -1}, "page_height_cm"),
+            ({"page_height_cm": True}, "page_height_cm"),
+            ({"page_height_cm": float("nan")}, "page_height_cm"),
+            ({"page_height_cm": 0.01}, "PDF page"),
         ]
         for change, message in cases:
             with self.subTest(change=change):

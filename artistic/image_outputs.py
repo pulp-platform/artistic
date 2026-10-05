@@ -108,7 +108,25 @@ def jpeg_background(render: dict) -> tuple[int, int, int]:
     return rgba[:3]
 
 
-def write_pdf(image, target: Path, dpi: float) -> None:
+def pdf_geometry(resolution: tuple[int, int] | list[int], render: dict) -> dict:
+    """Resolve an aspect-preserving image size and its enclosing PDF page."""
+    width, height = resolution
+    page_width = (_number(render["page_width_cm"], "[render].page_width_cm", positive=True)
+                  if "page_width_cm" in render else None)
+    page_height = (_number(render["page_height_cm"], "[render].page_height_cm", positive=True)
+                   if "page_height_cm" in render else None)
+    dpi = max(width * 2.54 / page_width if page_width is not None else 0,
+              height * 2.54 / page_height if page_height is not None else 0) or 300
+    image_cm = [width * 2.54 / dpi, height * 2.54 / dpi]
+    page_cm = [page_width if page_width is not None else image_cm[0],
+               page_height if page_height is not None else image_cm[1]]
+    return {"dpi": dpi, "page_cm": page_cm,
+            "page_size_pt": [value * 72 / 2.54 for value in page_cm],
+            "image_cm": image_cm}
+
+
+def write_pdf(image, target: Path, dpi: float,
+              page_size_pt: tuple[float, float] | list[float] | None = None) -> None:
     img2pdf, _ = _pdf_modules()
     rgb = opaque_rgb(image)
     source = rgb if rgb is not None else image
@@ -117,7 +135,11 @@ def write_pdf(image, target: Path, dpi: float) -> None:
             png = Path(directory) / "image.png"
             pdf = Path(directory) / "image.pdf"
             source.save(png, "PNG")
-            layout = img2pdf.get_fixed_dpi_layout_fun((dpi, dpi))
+            if page_size_pt is None:
+                layout = img2pdf.get_fixed_dpi_layout_fun((dpi, dpi))
+            else:
+                layout = lambda width, height, _dpi: (
+                    *page_size_pt, width * 72 / dpi, height * 72 / dpi)
             with pdf.open("wb") as output:
                 img2pdf.convert(str(png), layout_fun=layout, outputstream=output)
             pdf.replace(target)

@@ -15,14 +15,15 @@ from pathlib import Path
 
 from .project import (ProjectError, _project_name, filename_component, input_gds,
                       project_relative, recorded_path, sha256, work_relative, write_json)
-from .image_outputs import (_number, _pdf_modules, jpeg_background, jpeg_image, poster_options,
-                            write_pdf, write_poster)
+from .image_outputs import (_pdf_modules, jpeg_background, jpeg_image, pdf_geometry,
+                            poster_options, write_pdf, write_poster)
 from .palettes import background_rgba
 from .technology import inspect_layout, palette, selected_layers, run_pya
 
 
 def generation_hash(config: dict, section: str) -> str:
     settings = config.get(section, {})
+    dimensions = resolve_dimensions(settings, section)
     technology = config.get("technology", {})
     input_value = settings.get("input", "design")
     if input_value == "design":
@@ -38,9 +39,9 @@ def generation_hash(config: dict, section: str) -> str:
         tech_file = project_relative(config, Path(tech_file))
     value = {
         "input": identity,
-        "resolution": [int(item) for item in settings.get("resolution", [1000, 1000])],
-        "segments": [int(item) for item in settings.get("segments", [1, 1])],
-        "overrender": int(settings.get("overrender", 1)),
+        "resolution": dimensions["resolution"],
+        "segments": dimensions["segments"],
+        "overrender": dimensions["overrender"],
         "margin_um": float(settings.get("margin_um", 0)),
         "viewport_um": settings.get("viewport_um"),
         "layers": settings.get("layers", "routing"),
@@ -103,24 +104,55 @@ def _viewport(layout: dict, settings: dict) -> list[float]:
     return [bbox[0] - margin, bbox[1] - margin, bbox[2] + margin, bbox[3] + margin]
 
 
+def resolve_dimensions(settings: dict, section: str = "render") -> dict:
+    """Resolve output dimensions and bound raw segment sizes, including overrender."""
+    def positive_integer(value, label):
+        if type(value) is not int or value <= 0:
+            raise ProjectError(f"[{section}].{label} must be a positive integer")
+        return value
+
+    def pair(value, label):
+        if (not isinstance(value, (list, tuple)) or len(value) != 2 or
+                any(type(item) is not int or item <= 0 for item in value)):
+            raise ProjectError(f"[{section}].{label} must contain two positive integers")
+        return list(value)
+
+    resolution = pair(settings.get("resolution", [1000, 1000]), "resolution")
+    overrender = positive_integer(settings.get("overrender", 1), "overrender")
+    raw_resolution = [value * overrender for value in resolution]
+    bound = settings.get("max_px_tile")
+    if "max_px_tile" in settings:
+        bound = positive_integer(bound, "max_px_tile")
+    segments = pair(settings["segments"], "segments") if "segments" in settings else (
+        [(value + bound - 1) // bound for value in raw_resolution] if bound else [1, 1])
+    if any(count > size for count, size in zip(segments, raw_resolution)):
+        raise ProjectError(f"[{section}].segments exceed raw pixel dimensions")
+    if bound and any((size + count - 1) // count > bound
+                     for count, size in zip(segments, raw_resolution)):
+        raise ProjectError(f"[{section}].segments exceed max_px_tile raw segment size")
+    return {"resolution": resolution, "raw_resolution": raw_resolution,
+            "segments": segments, "overrender": overrender}
+
+
+def resolve_viewport(layout: dict, settings: dict, resolution: list[int]) -> list[float]:
+    """Return the centered, aspect-padded viewport used by the KLayout renderer."""
+    x0, y0, x1, y1 = _viewport(layout, settings)
+    if not all(math.isfinite(value) for value in (x0, y0, x1, y1)) or x1 <= x0 or y1 <= y0:
+        raise ProjectError("render viewport must define a positive finite area")
+    pitch = max((x1 - x0) / resolution[0], (y1 - y0) / resolution[1])
+    center_x, center_y = (x0 + x1) / 2, (y0 + y1) / 2
+    width, height = resolution[0] * pitch, resolution[1] * pitch
+    return [center_x - width / 2, center_y - height / 2,
+            center_x + width / 2, center_y + height / 2]
+
+
 def _settings(config: dict, manifest: dict, section: str, source: Path,
              selected: list[tuple[str, int, int]]) -> dict:
     settings = config.get(section, {})
-    resolution = settings.get("resolution", [1000, 1000])
-    segments = settings.get("segments", [1, 1])
-    if len(resolution) != 2 or min(map(int, resolution)) <= 0:
-        raise ProjectError(f"[{section}].resolution must contain two positive integers")
-    if len(segments) != 2 or min(map(int, segments)) <= 0:
-        raise ProjectError(f"[{section}].segments must contain two positive integers")
-    overrender = int(settings.get("overrender", 1))
-    if overrender <= 0:
-        raise ProjectError(f"[{section}].overrender must be positive")
-    if segments[0] > int(resolution[0]) * overrender or \
-            segments[1] > int(resolution[1]) * overrender:
-        raise ProjectError(f"[{section}].segments exceed raw pixel dimensions")
+    dimensions = resolve_dimensions(settings, section)
     for name, _, _ in selected:
         filename_component(name, f"[{section}].layers name")
-    viewport = _viewport(manifest["layout"], settings)
+    viewport = resolve_viewport(manifest["layout"], settings, dimensions["resolution"])
     raw_dir = Path(config["design"]["work_dir"]) / "raw" / section
     technology = dict(manifest["technology"])
     if technology.get("technology"):
@@ -131,8 +163,8 @@ def _settings(config: dict, manifest: dict, section: str, source: Path,
             "chip": _project_name(config),
             "input": work_relative(config, source), "input_sha256": sha256(source),
             "gds": {"file": work_relative(config, source), "viewport_um": viewport},
-            "resolution": [int(value) for value in resolution],
-            "segments": [int(value) for value in segments], "overrender": overrender,
+            "resolution": dimensions["resolution"],
+            "segments": dimensions["segments"], "overrender": dimensions["overrender"],
             "layers": [{"name": name, "layer": layer, "datatype": datatype}
                        for name, layer, datatype in selected],
             "raw_dir": work_relative(config, raw_dir),
@@ -327,11 +359,6 @@ def _colorize(mask, color: str, alpha: float):
     return rgba
 
 
-def _pdf_resolution(width: int, page_width_cm: object) -> float:
-    page_width = _number(page_width_cm, "[render].page_width_cm", positive=True)
-    return width * 2.54 / page_width
-
-
 def compose(config: dict) -> list[Path]:
     from PIL import Image
     work = Path(config["design"]["work_dir"])
@@ -358,9 +385,7 @@ def compose(config: dict) -> list[Path]:
     colors = palette(config, render, selected, routing=routing)
     background = background_rgba(colors.pop("background"))
     resolution = tuple(settings["resolution"])
-    page_width_cm = render.get("page_width_cm")
-    pdf_resolution = (_pdf_resolution(resolution[0], page_width_cm)
-                      if page_width_cm is not None else 300)
+    pdf = pdf_geometry(resolution, render)
     formats = render.get("formats", ["png", "jpg", "pdf"])
     if not isinstance(formats, list):
         raise ProjectError("[render].formats must be a list")
@@ -377,8 +402,7 @@ def compose(config: dict) -> list[Path]:
     if "pdf" in suffixes or poster is not None:
         _pdf_modules(poster=poster is not None)
     if "pdf" in suffixes and any(size < 3 or size > 14400 for size in
-                                 (resolution[0] * 72 / pdf_resolution,
-                                  resolution[1] * 72 / pdf_resolution)):
+                                 pdf["page_size_pt"]):
         raise ProjectError("render PDF page is outside the supported size range")
     raw = raw_layout(settings)
     image = Image.new("RGBA", resolution, background)
@@ -462,7 +486,7 @@ def compose(config: dict) -> list[Path]:
             target = work / f"{_project_name(config)}_render.{suffix}"
             if suffix == "pdf":
                 with _pixel_limit(image.width * image.height):
-                    write_pdf(image, target, pdf_resolution)
+                    write_pdf(image, target, pdf["dpi"], pdf["page_size_pt"])
             elif suffix in ("jpg", "jpeg"):
                 converted = jpeg_image(image, jpeg_matte)
                 try:

@@ -26,9 +26,13 @@ def parser() -> argparse.ArgumentParser:
             item.add_argument("project", metavar="PROJECT.toml")
             if stage in ("merge", "generate"):
                 item.add_argument("--technology", help="KLayout technology file")
+            if stage == "annotate":
+                item.add_argument("--if-configured", action="store_true",
+                                  help="skip annotation when no enabled outlines are configured")
     item = groups.add_parser("inspect", help="inspect layout and technology")
     item.add_argument("project", metavar="PROJECT.toml")
     item.add_argument("--technology", help="KLayout technology file")
+    item.add_argument("--json", action="store_true", help="print the inspection report as JSON")
     return command
 
 
@@ -41,14 +45,22 @@ def main(argv: list[str] | None = None) -> int:
         project = Project.load(args.project)
         technology = getattr(args, "technology", None)
         if args.group == "inspect":
-            print(json.dumps(project.inspect(technology), indent=2, sort_keys=True))
+            from .inspection import format_summary
+            report = project.inspect(technology)
+            print(json.dumps(report, indent=2, sort_keys=True) if args.json else format_summary(report))
         elif args.group == "logo" and args.stage == "prepare":
             print(project.prepare_logo())
         elif args.group == "logo":
             print(project.merge_logo(technology))
+            report = json.loads((project.work_dir / "logo_merge.json").read_text())
+            print(f"Logo: {report['accepted_pixels']} features, "
+                  f"{100 * report['logo_density']:.2f}% metal density in the logo canvas")
         elif args.group == "render" and args.stage == "generate":
             print(project.generate_render(technology))
         elif args.group == "render" and args.stage == "annotate":
+            outlines = project.config.get("render", {}).get("outlines")
+            if args.if_configured and (not outlines or not outlines.get("enabled", True)):
+                return 0
             print(*project.annotate_render(), sep="\n")
         elif args.group == "render":
             print(*project.compose_render(), sep="\n")
