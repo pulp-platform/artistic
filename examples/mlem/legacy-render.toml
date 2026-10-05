@@ -1,0 +1,57 @@
+# Copyright 2026 ETH Zurich and University of Bologna.
+# Licensed under the Apache License, Version 2.0, see LICENSE for details.
+# SPDX-License-Identifier: Apache-2.0
+# Render-only comparison using the chip GDS produced by the legacy logo flow.
+[design]
+name = "mlem"
+gds = "legacy/mlem_chip.gds.gz"
+work_dir = "legacy-render"
+
+[render]
+resolution = [2200, 2200]
+segments = [2, 2]
+overrender = 2
+viewport_um = [-100, -100, 2100, 2100]
+layers = "routing"
+palette = "legacy"
+page_width_cm = 84.1
+formats = ["png", "jpg", "pdf"]
+
+[palettes.legacy]
+background = "#000000"
+
+[palettes.legacy.layers]
+Cont = { color = "#0000cd", alpha = 0.8 }
+Metal1 = { color = "#0000cd", alpha = 0.8 }
+Via1 = { color = "#7ccd7c", alpha = 0.7 }
+Metal2 = { color = "#7ccd7c", alpha = 0.7 }
+Via2 = { color = "#5c0c02", alpha = 0.6 }
+Metal3 = { color = "#5c0c02", alpha = 0.6 }
+Via3 = { color = "#cd3700", alpha = 0.5 }
+Metal4 = { color = "#cd3700", alpha = 0.5 }
+Via4 = { color = "#00cd00", alpha = 0.5 }
+Metal5 = { color = "#00cd00", alpha = 0.5 }
+TopVia1 = { color = "#7fffd4", alpha = 0.5 }
+TopMetal1 = { color = "#7fffd4", alpha = 0.5 }
+TopVia2 = { color = "#1e90ff", alpha = 0.5 }
+TopMetal2 = { color = "#ffffff", alpha = 0.8 }
+
+[technology]
+routing = ["Cont", "Metal1", "Via1", "Metal2", "Via2", "Metal3", "Via3", "Metal4", "Via4", "Metal5", "TopVia1", "TopMetal1", "TopVia2", "TopMetal2"]
+top_metal = "TopMetal2"
+
+[technology.layers]
+Cont = "6/0"
+Metal1 = "8/0"
+Via1 = "19/0"
+Metal2 = "10/0"
+Via2 = "29/0"
+Metal3 = "30/0"
+Via3 = "49/0"
+Metal4 = "50/0"
+Via4 = "66/0"
+Metal5 = "67/0"
+TopVia1 = "125/0"
+TopMetal1 = "126/0"
+TopVia2 = "133/0"
+TopMetal2 = "134/0"

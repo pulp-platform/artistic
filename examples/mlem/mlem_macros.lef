@@ -1,0 +1,12 @@
+# Copyright 2026 ETH Zurich and University of Bologna.
+# Licensed under the Apache License, Version 2.0, see LICENSE for details.
+# SPDX-License-Identifier: Apache-2.0
+# Bounding-box fixture for annotation of the bundled MLEM layout only.
+# This is not a physical-design or LVS model.
+VERSION 5.8 ;
+MACRO RM_IHPSG13_1P_1024x64_c2_bm_bist
+  CLASS BLOCK ;
+  ORIGIN 0 0 ;
+  SIZE 784.48 BY 336.46 ;
+END RM_IHPSG13_1P_1024x64_c2_bm_bist
+END LIBRARY
