@@ -9,29 +9,60 @@ work_dir = "work"
 repository = "pulp-platform/croc"
 
 [logo]
-source = "mlem_logo.svg"
-width_um = 1320
-height_um = 1320
-feature_um = 2
+source = "mlem_logo.png"
+width_um = 1576
+height_um = 1576
+feature_um = 4
+pitch_um = 6
+spacing_um = 2
+max_feature_um = 30
 layer = "top-metal"
 dither = "threshold"
 
 [render]
 input = "logo"
 resolution = [2200, 2200]
-segments = [1, 1]
+max_px_tile = 2200
 overrender = 2
 layers = "routing"
-margin_um = 100
+viewport_um = [-100, -100, 2100, 2100]
 palette = "mlem"
 formats = ["png", "jpg", "pdf"]
+page_width_cm = 84.1
+
+[render.poster]
+grid = [2, 2]
+page_size_mm = [210, 297]
+margin_mm = 10
+overlap_mm = 5
+
+[render.outlines]
+def = "mlem.def.gz"
+lef_files = ["mlem_macros.lef"]
+resolution = 140
+min_area_pixels = 50
+background_opacity = 0.65
+font_size = 28
+stroke_width = 1.5
+label_lightness = 0.25
+formats = ["svg", "png", "jpg", "pdf"]
+
+[render.outlines.modules]
+i_apb_uart = { label = "UART", color = "#f88c05" }
+i_dm_top = { label = "Debug", color = "#d489cc" }
+i_dmi_jtag = { label = "JTAG", color = "#80499c" }
+i_timer = { label = "Timer", color = "#f3d408" }
+i_core_wrap = { label = "Core", color = "#fb120d" }
+i_user = { label = "User", color = "#1bb32c" }
+i_gpio = { label = "GPIO", color = "#43fdaa" }
+gen_sram_bank = { label = "SRAM", color = "#39729f" }
 
 [map]
 input = "logo"
 resolution = [12288, 12288]
 segments = [3, 3]
 layers = "routing"
-margin_um = 100
+viewport_um = [-100, -100, 2100, 2100]
 palette = "mlem"
 tile_size = 512
 output = "map"
@@ -83,3 +114,24 @@ alpha = 0.5
 [palettes.mlem.layers.TopMetal2]
 color = "#ffffff"
 alpha = 0.8
+
+# The bundled example uses the original SG13G2 seven-metal stack.
+[technology]
+routing = ["Cont", "Metal1", "Via1", "Metal2", "Via2", "Metal3", "Via3", "Metal4", "Via4", "Metal5", "TopVia1", "TopMetal1", "TopVia2", "TopMetal2"]
+top_metal = "TopMetal2"
+
+[technology.layers]
+Cont = "6/0"
+Metal1 = "8/0"
+Via1 = "19/0"
+Metal2 = "10/0"
+Via2 = "29/0"
+Metal3 = "30/0"
+Via3 = "49/0"
+Metal4 = "50/0"
+Via4 = "66/0"
+Metal5 = "67/0"
+TopVia1 = "125/0"
+TopMetal1 = "126/0"
+TopVia2 = "133/0"
+TopMetal2 = "134/0"
