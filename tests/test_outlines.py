@@ -22,19 +22,20 @@ except Exception:  # Optional renderer may be installed without a working Cairo 
 from artistic.outlines import (_canvas, _def_groups, _lef_sizes, _matches, _pixel_box,
                                _options, _placed_box, _trace, _region_anchors,
                                _trace_anchors, _component_masks, _hierarchy_modules,
-                               _group_placements, annotate)
+                               _group_placements, _offset_placements, annotate)
 from artistic.project import ProjectError, sha256, work_relative, write_json
 from artistic.render import composition_hash, generation_hash
 
 
 def _render_svg(source, target, width, height):
-    if cairosvg:
-        cairosvg.svg2png(url=str(source), write_to=str(target), output_width=width,
-                        output_height=height)
-    else:
-        subprocess.run([shutil.which("inkscape"), str(source), f"--export-width={width}",
+    inkscape = shutil.which("inkscape")
+    if inkscape:
+        subprocess.run([inkscape, str(source), f"--export-width={width}",
                         f"--export-height={height}", f"--export-filename={target}"],
                        check=True, capture_output=True)
+    else:
+        cairosvg.svg2png(url=str(source), write_to=str(target), output_width=width,
+                        output_height=height)
 
 
 DEF = r"""VERSION 5.8 ;
@@ -134,6 +135,57 @@ class OutlineTests(unittest.TestCase):
                     "FE": (0, 0, 4, 10), "FW": (0, 0, 4, 10)}
         for orientation, box in expected.items():
             self.assertEqual(_placed_box(0, 0, 10, 4, orientation), box)
+
+    def test_placement_offset_defaults_and_signed_translation(self):
+        _, _, _, _, _ = _options(self.config)
+        placements = [("i_uart/u_cell", (10, 20, 30, 40))]
+        self.assertEqual(_offset_placements(placements, [0, 0]), placements)
+        self.assertEqual(_offset_placements(placements, [5.5, -7]),
+                         [("i_uart/u_cell", (15.5, 13, 35.5, 33))])
+        self.config["render"]["outlines"]["offset_um"] = [5, -7]
+        self.assertEqual(_options(self.config)[0]["offset_um"], [5, -7])
+
+    def test_invalid_placement_offsets_are_rejected(self):
+        offsets = (None, "1,2", (1, 2), [], [1], [1, 2, 3], [True, 0],
+                   ["1", 0], [float("nan"), 0], [0, float("inf")],
+                   [float("-inf"), 0])
+        for offset in offsets:
+            self.config["render"]["outlines"]["offset_um"] = offset
+            with self.subTest(offset=offset), self.assertRaisesRegex(
+                    ProjectError, r"offset_um must be a pair of finite numbers"):
+                _options(self.config)
+
+    def test_annotation_translates_placement_before_viewport_clipping(self):
+        self._render_receipt()
+        self.config["render"]["outlines"].update(offset_um=[88, 20], resolution=100)
+        traced = []
+
+        def trace(mask, path, min_area_pixels):
+            pixels = mask.convert("L")
+            black = [(x, y) for y in range(pixels.height) for x in range(pixels.width)
+                     if pixels.getpixel((x, y)) == 0]
+            traced.append((min(x for x, _ in black), min(y for _, y in black),
+                           max(x for x, _ in black), max(y for _, y in black)))
+            svg = ET.Element("{http://www.w3.org/2000/svg}svg", {"viewBox": "0 0 50 50"})
+            group = ET.SubElement(svg, "{http://www.w3.org/2000/svg}g")
+            ET.SubElement(group, "{http://www.w3.org/2000/svg}path", {"d": "M 1 1"})
+            return svg
+
+        def anchor(mask, path, min_area_pixels):
+            left, top, right, bottom = traced[-1]
+            return [((left + right + 1) / 2, (top + bottom + 1) / 2)]
+
+        with patch("artistic.outlines._trace", side_effect=trace), \
+                patch("artistic.outlines._trace_anchors", side_effect=anchor):
+            output = annotate(self.config)[0]
+        root = ET.parse(output).getroot()
+        self.assertEqual(root.attrib["viewBox"], "0 0 100 100")
+        self.assertEqual(traced, [(98, 50, 99, 59)])
+        labels = root.findall("{http://www.w3.org/2000/svg}text")
+        self.assertEqual(len(labels), 1)
+        self.assertAlmostEqual(float(labels[0].attrib["x"]), 99)
+        self.assertAlmostEqual(float(labels[0].attrib["y"]), 55)
+        self.assertTrue(root.findall(".//{http://www.w3.org/2000/svg}path"))
 
     def test_recursive_lef_pattern_resolves_macro_dimensions(self):
         deep = self.root / "libraries" / "cells" / "macros"
