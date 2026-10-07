@@ -204,6 +204,7 @@ then run `make PROJECT=... render-annotate` after `render-compose`:
 [render.outlines]
 def = "chip.def"
 lef_files = ["macros/*.lef"]
+offset_um = [0, 0]
 resolution = 200
 min_area_pixels = 50
 background_opacity = 0.65
@@ -218,8 +219,12 @@ i_core = { label = "Core", color = "#fb120d" }
 
 Module keys select instance groups. `resolution` limits the raster used to
 trace outlines: a coarse grid groups nearby cells into module regions.
-The default is 200; keep it modest because connected-region and label analysis
-cost grows with the pixel count. High values can be slow and memory-intensive.
+The default resolution is 200; keep it modest because connected-region and
+label analysis cost grows with the pixel count. High values can be slow and
+memory-intensive.
+`offset_um` is a `[dx, dy]` pair in microns, defaulting to `[0, 0]`; use it
+when the GDS was translated relative to the DEF. Positive `dx` shifts right
+and positive `dy` shifts up. It moves placements only, not the render viewport.
 `min_area_pixels` removes smaller isolated regions from that tracing grid.
 Font and stroke sizes are output-image pixels. LEFs supply macro sizes;
 `**` in a LEF glob searches nested directories. Annotation follows the render

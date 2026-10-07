@@ -130,6 +130,12 @@ def _group_placements(placements: list, modules: dict, rooted: set | None = None
     return groups
 
 
+def _offset_placements(placements: list, offset: list[float]) -> list:
+    dx, dy = offset
+    return [(name, (box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy))
+            for name, box in placements]
+
+
 def _def_groups(path: Path, modules: dict, lef_sizes: dict[str, tuple[float, float]]
                 ) -> dict[str, list[tuple[float, float, float, float]]]:
     return _group_placements(_def_placements(path, lef_sizes), modules)
@@ -200,6 +206,17 @@ def _options(config: dict) -> tuple[dict, Path, list[Path], dict, list[str]]:
         raise ProjectError("[render.outlines] is disabled")
     if not settings.get("def"):
         raise ProjectError("[render.outlines].def is required")
+    offset = settings.get("offset_um", [0, 0])
+    valid_offset = isinstance(offset, list) and len(offset) == 2
+    if valid_offset:
+        valid_offset = all(type(value) in (int, float) for value in offset)
+    if valid_offset:
+        try:
+            valid_offset = all(math.isfinite(float(value)) for value in offset)
+        except OverflowError:
+            valid_offset = False
+    if not valid_offset:
+        raise ProjectError("[render.outlines].offset_um must be a pair of finite numbers")
     def_file = _project_path(config, settings["def"])
     if not def_file.is_file():
         raise ProjectError(f"outline DEF not found: {def_file}")
@@ -469,7 +486,8 @@ def annotate(config: dict) -> list[Path]:
     settings, def_file, lef_files, modules, formats = _options(config)
     image, resolution, viewport = _receipt(config)
     jpeg_matte = jpeg_background(config.get("render", {})) if "jpg" in formats else None
-    placements = _def_placements(def_file, _lef_sizes(lef_files))
+    placements = _offset_placements(_def_placements(def_file, _lef_sizes(lef_files)),
+                                    settings.get("offset_um", [0, 0]))
     rooted = set()
     if settings.get("hierarchy") is not None:
         modules, rooted = _hierarchy_modules(placements, settings["hierarchy"], modules)
