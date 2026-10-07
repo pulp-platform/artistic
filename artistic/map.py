@@ -130,11 +130,45 @@ def _tile_writer(output: Path, tile_size: int, zoom: int, background, layer_styl
                     tile = Image.new("RGBA", (tile_size, tile_size), fill)
                 left_i, top_i = max(left, tx * tile_size), max(top, ty * tile_size)
                 right_i, bottom_i = min(right, (tx + 1) * tile_size), min(bottom, (ty + 1) * tile_size)
-                crop = image.crop((left_i - left, top_i - top, right_i - left, bottom_i - top))
-                tile.paste(crop, (left_i - tx * tile_size, top_i - ty * tile_size))
+                with image.crop((left_i - left, top_i - top,
+                                 right_i - left, bottom_i - top)) as crop:
+                    tile.paste(crop, (left_i - tx * tile_size, top_i - ty * tile_size))
                 tile.save(target)
                 tile.close()
     return write
+
+
+def _parent_tile(layer_root: Path, child_zoom: int, tx: int, ty: int,
+                 tile_size: int, child_shape: tuple[int, int], fill):
+    from PIL import Image
+
+    # LANCZOS at half scale reaches six source pixels beyond a tile edge.
+    # An even eight-pixel halo also keeps every parent's sampling grid aligned.
+    halo = 8
+    left, top = 2 * tx * tile_size - halo, 2 * ty * tile_size - halo
+    size = 2 * tile_size + 2 * halo
+    right, bottom = left + size, top + size
+    with Image.new("RGBA", (size, size), fill) as canvas:
+        for child_x in range(max(0, left // tile_size),
+                             min(child_shape[0], (right - 1) // tile_size + 1)):
+            for child_y in range(max(0, top // tile_size),
+                                 min(child_shape[1], (bottom - 1) // tile_size + 1)):
+                child = layer_root / str(child_zoom) / str(child_x) / f"{child_y}.png"
+                if not child.is_file():
+                    continue
+                child_left, child_top = child_x * tile_size, child_y * tile_size
+                crop_left, crop_top = max(left, child_left), max(top, child_top)
+                crop_right = min(right, child_left + tile_size)
+                crop_bottom = min(bottom, child_top + tile_size)
+                with Image.open(child) as image:
+                    with image.crop((crop_left - child_left, crop_top - child_top,
+                                     crop_right - child_left, crop_bottom - child_top)) as crop:
+                        with crop.convert("RGBA") as rgba:
+                            canvas.paste(rgba, (crop_left - left, crop_top - top))
+        # Pillow's RGBA resize filters premultiplied alpha, avoiding color fringes.
+        with canvas.resize((size // 2, size // 2), Image.Resampling.LANCZOS) as resized:
+            margin = halo // 2
+            return resized.crop((margin, margin, margin + tile_size, margin + tile_size))
 
 
 def build(config: dict) -> Path:
@@ -218,32 +252,25 @@ def build(config: dict) -> Path:
             if composite is not None:
                 write_tile("composite", composite, xoffset[source_x], yoffset[logical_y])
                 composite.close()
-    # Build the lower zoom levels from four children at a time.  Only one
-    # parent canvas is kept in memory, so large maps do not scale with the
-    # number of tiles.
+    # Keep one parent canvas and its neighboring halo in memory, independent
+    # of the number of tiles in the map.
     nx = max(1, math.ceil(raw["width"] / tile_size))
     ny = max(1, math.ceil(raw["height"] / tile_size))
     for name in names:
         layer_root = output / name
         for zoom in range(max_zoom - 1, -1, -1):
             factor = 2 ** (max_zoom - zoom)
+            child_shape = (math.ceil(nx / (factor // 2)), math.ceil(ny / (factor // 2)))
             for tx in range(max(1, math.ceil(nx / factor))):
                 for ty in range(max(1, math.ceil(ny / factor))):
                     fill = (bg if name == "composite" else
                             (255, 255, 255, 255) if layer_style == "mask" else
                             (0, 0, 0, 0))
-                    canvas = Image.new("RGBA", (tile_size * 2, tile_size * 2), fill)
-                    for dx in (0, 1):
-                        for dy in (0, 1):
-                            child = layer_root / str(zoom + 1) / str(2 * tx + dx) / f"{2 * ty + dy}.png"
-                            if child.is_file():
-                                with Image.open(child) as image:
-                                    canvas.paste(image.convert("RGBA"),
-                                                 (dx * tile_size, dy * tile_size))
                     target = layer_root / str(zoom) / str(tx) / f"{ty}.png"
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    canvas.resize((tile_size, tile_size), Image.Resampling.LANCZOS).save(target)
-                    canvas.close()
+                    with _parent_tile(layer_root, zoom + 1, tx, ty, tile_size,
+                                      child_shape, fill) as parent:
+                        parent.save(target)
     metadata = {"layers": names, "tile_size": tile_size, "max_zoom": max_zoom,
                 "width": raw["width"], "height": raw["height"]}
     (output / "map.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -252,14 +279,15 @@ def build(config: dict) -> Path:
 
 
 def _viewer(metadata: dict) -> str:
-    return """<!doctype html><meta charset="utf-8"><title>ArtistIC map</title>
+    return """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>ArtistIC map</title>
+<style>body{margin:0}#map{position:fixed;inset:0}</style>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
  integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
-<div id="map" style="height:100vh"></div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+<div id="map"></div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
  integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-<script>const names=%s,maxZoom=%d,map=L.map('map',{crs:L.CRS.Simple,minZoom:0,maxZoom});
+<script>const names=%s,maxZoom=%d,map=L.map('map',{crs:L.CRS.Simple,minZoom:-5,maxZoom});
 const bounds=L.latLngBounds(map.unproject([0,%s],maxZoom),map.unproject([%s,0],maxZoom));
-const layers=Object.fromEntries(names.map(n=>[n,L.tileLayer(`${n}/{z}/{x}/{y}.png`,{tileSize:%d,noWrap:true,bounds,maxNativeZoom:maxZoom})]));
-layers[names[0]].addTo(map);L.control.layers(layers).addTo(map);map.fitBounds(bounds);</script>""" % (
+const layers=Object.fromEntries(names.map(n=>[n,L.tileLayer(`${n}/{z}/{x}/{y}.png`,{tileSize:%d,noWrap:true,bounds,minZoom:-5,minNativeZoom:0,maxNativeZoom:maxZoom})]));
+layers[names[0]].addTo(map);L.control.layers(layers,null,{collapsed:!L.Browser.touch}).addTo(map);map.fitBounds(bounds);</script>""" % (
         json.dumps(metadata["layers"]), metadata["max_zoom"], metadata["height"],
         metadata["width"], metadata["tile_size"])

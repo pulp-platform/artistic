@@ -7,9 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
-from artistic.map import _safe_output, build
+from artistic.map import _parent_tile, _safe_output, _viewer, build
 from artistic.palettes import background_rgba, palette
 from artistic.project import ProjectError, sha256
 from artistic.render import generation_hash
@@ -161,6 +161,51 @@ class MapStyleTests(unittest.TestCase):
             self.assertEqual(self._pixel(output, "composite", 1, 2, 1)[3], 191)
             self.assertEqual(self._pixel(output, "composite", 1, 1, 1)[3], 128)
 
+    def test_build_parents_match_shared_downsample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = self._fixture(root, "transparent")
+            config["map"].update({"resolution": [128, 128], "tile_size": 32,
+                                  "layer_style": "color"})
+            raw_path = root / "raw" / "RAW__chip_1.0.M1_0-0.png"
+            with Image.new("L", (128, 128), 255) as source:
+                draw = ImageDraw.Draw(source)
+                draw.line((63, 0, 65, 127), fill=0, width=3)
+                draw.line((0, 64, 127, 62), fill=0, width=3)
+                source.save(raw_path)
+            settings = json.loads((root / "map.json").read_text())
+            settings["resolution"] = [128, 128]
+            settings["generation_sha256"] = generation_hash(config, "map")
+            settings["raw_sha256"] = {raw_path.name: sha256(raw_path)}
+            (root / "map.json").write_text(json.dumps(settings))
+            output = build(config)
+            metadata = json.loads((output / "map.json").read_text())
+            self.assertEqual(metadata, {"layers": ["composite", "M1"], "tile_size": 32,
+                                        "max_zoom": 2, "width": 128, "height": 128})
+            for view in metadata["layers"]:
+                with self.subTest(view=view), Image.new("RGBA", (144, 144)) as shared:
+                    for tx in range(4):
+                        for ty in range(4):
+                            with Image.open(output / view / "2" / str(tx) / f"{ty}.png") as child:
+                                shared.paste(child, (8 + tx * 32, 8 + ty * 32))
+                    with shared.resize((72, 72), Image.Resampling.LANCZOS) as reduced:
+                        with reduced.crop((4, 4, 68, 68)) as expected:
+                            with Image.new("RGBA", (64, 64)) as stitched:
+                                for tx in range(2):
+                                    for ty in range(2):
+                                        with Image.open(output / view / "1" / str(tx) / f"{ty}.png") as parent:
+                                            stitched.paste(parent, (tx * 32, ty * 32))
+                                self.assertTrue(stitched.tobytes() == expected.tobytes(),
+                                                "Built parent tiles differ from shared downsample")
+                                with Image.new("RGBA", (80, 80)) as final_shared:
+                                    final_shared.paste(stitched, (8, 8))
+                                    with final_shared.resize((40, 40), Image.Resampling.LANCZOS) as final_reduced:
+                                        with final_reduced.crop((4, 4, 36, 36)) as final_expected:
+                                            with Image.open(output / view / "0" / "0" / "0.png") as final_parent:
+                                                self.assertTrue(final_parent.tobytes() == final_expected.tobytes(),
+                                                                "Final parent differs from shared downsample")
+                self.assertEqual(len(list((output / view).rglob("*.png"))), 21)
+
     def test_palette_and_style_do_not_change_generation_hash(self):
         config = {"map": {"resolution": [10, 10]},
                   "palettes": {"p": {"background": "white"}}}
@@ -199,6 +244,100 @@ class MapStyleTests(unittest.TestCase):
                         _safe_output(config)
             self.assertEqual(def_file.read_text(), "DEF")
             self.assertEqual(lef.read_text(), "LEF")
+
+
+class MapPyramidTests(unittest.TestCase):
+    def _assert_shared_downsample(self, tile_size, fill, child_shape=(4, 4), missing=()):
+        with tempfile.TemporaryDirectory() as directory:
+            layer_root = Path(directory)
+            extent = 4 * tile_size
+            halo = 8
+            children = []
+            with Image.new("RGBA", (extent, extent), fill) as source:
+                draw = ImageDraw.Draw(source)
+                boundary = 2 * tile_size
+                draw.rectangle((boundary - 3, 0, boundary + 1, extent - 1),
+                               fill=(25, 115, 240, 96))
+                draw.rectangle((0, boundary - 1, extent - 1, boundary + 2),
+                               fill=(230, 40, 70, 255))
+                draw.line((0, extent - 1, extent - 1, 0), fill=(50, 200, 30, 180), width=3)
+                draw.rectangle((boundary + 2, boundary - 8, boundary + 3, boundary + 8),
+                               fill=(0, 255, 0, 0))
+                with Image.new("RGBA", (extent + 2 * halo, extent + 2 * halo), fill) as shared:
+                    for child_x in range(child_shape[0]):
+                        for child_y in range(child_shape[1]):
+                            if (child_x, child_y) in missing:
+                                continue
+                            path = layer_root / "1" / str(child_x) / f"{child_y}.png"
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            with source.crop((child_x * tile_size, child_y * tile_size,
+                                              (child_x + 1) * tile_size,
+                                              (child_y + 1) * tile_size)) as child:
+                                child.save(path)
+                                children.append(path)
+                                shared.paste(child, (halo + child_x * tile_size,
+                                                     halo + child_y * tile_size))
+                    # Files outside the declared child grid must not enter the halo.
+                    for child_x, child_y in ((-1, 0), (0, -1), (child_shape[0], 0),
+                                              (0, child_shape[1])):
+                        path = layer_root / "1" / str(child_x) / f"{child_y}.png"
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        with Image.new("RGBA", (tile_size, tile_size), "magenta") as decoy:
+                            decoy.save(path)
+                    with shared.resize((extent // 2 + halo, extent // 2 + halo),
+                                       Image.Resampling.LANCZOS) as reduced:
+                        with reduced.crop((halo // 2, halo // 2,
+                                           halo // 2 + extent // 2,
+                                           halo // 2 + extent // 2)) as expected:
+                            with Image.new("RGBA", expected.size) as stitched:
+                                for tx in range(2):
+                                    for ty in range(2):
+                                        with _parent_tile(layer_root, 1, tx, ty, tile_size,
+                                                          child_shape, fill) as parent:
+                                            self.assertEqual(parent.size, (tile_size, tile_size))
+                                            stitched.paste(parent, (tx * tile_size, ty * tile_size))
+                                self.assertTrue(stitched.tobytes() == expected.tobytes(),
+                                                "Stitched parents differ from shared downsample")
+                                # Hidden RGB must not affect premultiplied-alpha filtering.
+                                for path in children:
+                                    with Image.open(path) as child:
+                                        with child.convert("RGBA") as rgba:
+                                            with rgba.getchannel("A") as alpha:
+                                                with alpha.point(lambda value: 255 if value == 0 else 0) as hidden:
+                                                    rgba.paste((0, 0, 0, 0), (0, 0, tile_size, tile_size), hidden)
+                                            rgba.save(path)
+                                for tx in range(2):
+                                    for ty in range(2):
+                                        with _parent_tile(layer_root, 1, tx, ty, tile_size,
+                                                          child_shape, fill) as parent:
+                                            with expected.crop((tx * tile_size, ty * tile_size,
+                                                                (tx + 1) * tile_size,
+                                                                (ty + 1) * tile_size)) as reference:
+                                                self.assertTrue(parent.tobytes() == reference.tobytes(),
+                                                                "Hidden RGB changes parent downsample")
+
+    def test_adjacent_parents_match_shared_rgba_downsample(self):
+        for tile_size in (31, 32, 512):
+            for fill in ((255, 255, 255, 255), (0, 0, 0, 0), (15, 30, 45, 128)):
+                with self.subTest(tile_size=tile_size, fill=fill):
+                    self._assert_shared_downsample(tile_size, fill)
+
+    def test_sparse_edges_match_shared_downsample(self):
+        for fill in ((255, 255, 255, 255), (0, 0, 0, 0), (15, 30, 45, 128)):
+            with self.subTest(fill=fill):
+                self._assert_shared_downsample(32, fill, child_shape=(3, 3), missing=((1, 1),))
+
+    def test_viewer_fits_small_viewports_without_changing_layer_names(self):
+        html = _viewer({"layers": ["composite", "TopMetal2"], "tile_size": 512,
+                        "max_zoom": 3, "width": 3500, "height": 2800})
+        self.assertIn('<meta name="viewport" content="width=device-width, initial-scale=1">', html)
+        self.assertIn("body{margin:0}#map{position:fixed;inset:0}", html)
+        self.assertIn("crs:L.CRS.Simple,minZoom:-5,maxZoom", html)
+        self.assertIn("minZoom:-5,minNativeZoom:0,maxNativeZoom:maxZoom", html)
+        self.assertIn("collapsed:!L.Browser.touch", html)
+        self.assertIn('names=["composite", "TopMetal2"]', html)
+        self.assertIn("`${n}/{z}/{x}/{y}.png`", html)
+        self.assertIn("map.fitBounds(bounds)", html)
 
 
 if __name__ == "__main__":

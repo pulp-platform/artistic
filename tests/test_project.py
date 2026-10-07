@@ -213,7 +213,7 @@ lef_files = ["../lef/*.lef"]
     def test_map_viewer_exposes_generated_views(self):
         html = _viewer({"layers": ["composite", "Metal1"], "height": 100,
                         "width": 200, "max_zoom": 2, "tile_size": 50})
-        self.assertIn("L.control.layers(layers)", html)
+        self.assertIn("L.control.layers(layers,null,{collapsed:!L.Browser.touch})", html)
         self.assertIn("map.unproject([200,0],maxZoom)", html)
         self.assertIn('"composite", "Metal1"', html)
 
