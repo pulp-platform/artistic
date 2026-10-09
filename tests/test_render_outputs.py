@@ -116,6 +116,81 @@ class RenderOutputTests(unittest.TestCase):
             with self.Image.open(png) as image:
                 self.assertEqual(rgb.tobytes(), image.convert("RGB").tobytes())
 
+    def test_optional_shadow_preserves_base_receipt_and_pdf_pixels(self):
+        self.config["render"]["shadow"] = {"padding_px": 4, "blur_px": 1,
+                                             "offset_px": [1, 2]}
+        self.config["palettes"]["test"]["background"] = "#ffffff"
+        self.settings["layout"] = {"bbox_um": [1, 2, 12, 9]}
+        (self.root / "render.json").write_text(json.dumps(self.settings))
+        png, pdf = compose(self.config)
+        receipt = json.loads((self.root / "render_output.json").read_text())
+        self.assertEqual(receipt["image"], "chip_render_base.png")
+        self.assertEqual(receipt["resolution"], [11, 7])
+        with self.Image.open(png) as presented, self.Image.open(self.root / receipt["image"]) as base:
+            self.assertEqual(presented.size, (19, 15))
+            self.assertEqual(base.size, (11, 7))
+            self.assertEqual(presented.crop((4, 4, 15, 11)).tobytes(), base.tobytes())
+            with self.pikepdf.Pdf.open(pdf) as document:
+                _, rgb, alpha = self._pdf_image(document.pages[0])
+                self.assertIsNone(alpha)
+                self.assertEqual(rgb.tobytes(), presented.convert("RGB").tobytes())
+        self.assertEqual(receipt["image_sha256"], sha256(self.root / receipt["image"]))
+        self.assertEqual(generation_hash(self.config, "render"),
+                         self.settings["generation_sha256"])
+
+    def test_disabled_shadow_retains_original_filenames_and_dimensions(self):
+        self.config["render"]["shadow"] = {"enabled": False}
+        png, _ = compose(self.config)
+        with self.Image.open(png) as image:
+            self.assertEqual(image.size, (11, 7))
+        self.assertEqual(json.loads((self.root / "render_output.json").read_text())["image"],
+                         "chip_render.png")
+        self.assertFalse((self.root / "chip_render_base.png").exists())
+
+    def test_shadow_crop_respects_configured_pixel_limit(self):
+        self.config["render"]["shadow"] = {"padding_px": 4}
+        self.settings["layout"] = {"bbox_um": [1, 2, 12, 9]}
+        (self.root / "render.json").write_text(json.dumps(self.settings))
+        with patch.object(self.Image, "MAX_IMAGE_PIXELS", 1):
+            png, _ = compose(self.config)
+            self.assertEqual(self.Image.MAX_IMAGE_PIXELS, 1)
+        with self.Image.open(png) as image:
+            self.assertEqual(image.size, (19, 15))
+
+    def test_shadow_transparent_and_translucent_png_and_pdf(self):
+        self.config["render"]["shadow"] = {"padding_px": 4, "blur_px": 1}
+        self.settings["layout"] = {"bbox_um": [1, 2, 12, 9]}
+        (self.root / "render.json").write_text(json.dumps(self.settings))
+        for background in ("transparent", "#33669980"):
+            with self.subTest(background=background):
+                self.config["palettes"]["test"]["background"] = background
+                png, pdf = compose(self.config)
+                with self.Image.open(png) as presented, \
+                        self.Image.open(self.root / "chip_render_base.png") as base:
+                    self.assertEqual(presented.crop((4, 4, 15, 11)).tobytes(), base.tobytes())
+                    with self.pikepdf.Pdf.open(pdf) as document:
+                        _, rgb, alpha = self._pdf_image(document.pages[0])
+                        self.assertEqual(rgb.tobytes(), presented.convert("RGB").tobytes())
+                        self.assertEqual(alpha.tobytes(), presented.getchannel("A").tobytes())
+
+    def test_invalid_shadow_fails_before_composition_and_removes_receipt(self):
+        compose(self.config)
+        for shadow in ({"padding_px": -1}, {}):
+            self.config["render"]["shadow"] = shadow
+            with self.subTest(shadow=shadow), patch("artistic.render.raw_layout") as raw:
+                with self.assertRaises(ProjectError):
+                    compose(self.config)
+                raw.assert_not_called()
+                self.assertFalse((self.root / "render_output.json").exists())
+
+    def test_presentation_does_not_change_generation_or_base_composition_hash(self):
+        generation = generation_hash(self.config, "render")
+        composition = composition_hash(self.config, self.settings)
+        self.config["render"]["shadow"] = {"padding_px": 4, "blur_px": 1}
+        self.config["render"]["outlines"] = {"stroke_border_width": 2, "font_weight": "bold"}
+        self.assertEqual(generation_hash(self.config, "render"), generation)
+        self.assertEqual(composition_hash(self.config, self.settings), composition)
+
     def test_pdf_physical_height_and_aspect_fit_page(self):
         for change, expected_cm, expected_image_cm in (
                 ({"page_height_cm": 5.08}, (5.08 * 11 / 7, 5.08), (5.08 * 11 / 7, 5.08)),

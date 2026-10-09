@@ -23,7 +23,10 @@ from artistic.outlines import (_canvas, _def_groups, _lef_sizes, _matches, _pixe
                                _options, _placed_box, _trace, _region_anchors,
                                _trace_anchors, _component_masks, _hierarchy_modules,
                                _group_placements, _offset_placements, annotate)
+from artistic.outlines import (_anchor_component, _place_labels, _query_label_bounds,
+                               _style_paths, _transform_scale)
 from artistic.project import ProjectError, sha256, work_relative, write_json
+from artistic.presentation import decorate
 from artistic.render import composition_hash, generation_hash
 
 
@@ -66,6 +69,285 @@ END MACRO
 
 
 class OutlineTests(unittest.TestCase):
+    def test_contrast_option_validation(self):
+        settings = self.config["render"]["outlines"]
+        for name, values in {
+            "stroke_border_width": [-1, float("inf"), float("nan"), True, "2"],
+            "label_border_width": [-1, None],
+            "stroke_border_color": ["none", "#00000000", 3],
+            "label_border_color": ["invalid"],
+            "label_color": ["#ffffff80"],
+            "font_weight": ["heavy", 2],
+            "avoid_label_overlap": [1, "true"],
+        }.items():
+            for value in values:
+                with self.subTest(name=name, value=value):
+                    settings[name] = value
+                    with self.assertRaises(ProjectError):
+                        _options(self.config)
+            settings.pop(name)
+        settings.update(label_color="white", font_weight="bold", label_border_width=2,
+                        stroke_border_width=1.6, avoid_label_overlap=True)
+        _options(self.config)
+
+    def test_label_query_validates_numeric_bounds_and_accepts_signed_positions(self):
+        result = subprocess.CompletedProcess([], 0, "label-0,-2.5,-4,12,8\n", "")
+        with patch("artistic.outlines.tool", return_value="inkscape"), \
+                patch("artistic.outlines.subprocess.run", return_value=result):
+            self.assertEqual(_query_label_bounds(self.work / "test.svg", ["label-0"]),
+                             {"label-0": (-2.5, -4., 12., 8.)})
+            for output in ("label-0,0,0,nan,8", "label-0,0,0,-1,8", "label-0,1,2,3", ""):
+                result.stdout = output
+                with self.subTest(output=output), self.assertRaises(ProjectError):
+                    _query_label_bounds(self.work / "test.svg", ["label-0"])
+
+    def test_path_widths_compensate_nested_transforms(self):
+        root = ET.fromstring('<g xmlns="http://www.w3.org/2000/svg" transform="scale(5 5)">'
+                             '<g transform="translate(0 40) scale(0.1 -0.1)">'
+                             '<path d="M0 0L10 10" vector-effect="non-scaling-stroke"/></g></g>')
+        _style_paths(root, "#ffffff", 3.2, 1.6, "#000000")
+        paths = list(root.iter("{http://www.w3.org/2000/svg}path"))
+        self.assertEqual(len(paths), 2)
+        self.assertAlmostEqual(float(paths[0].get("stroke-width")) * .5, 6.4)
+        self.assertAlmostEqual(float(paths[1].get("stroke-width")) * .5, 3.2)
+        self.assertTrue(all("vector-effect" not in p.attrib for p in paths))
+        self.assertAlmostEqual(_transform_scale("scale(1 4)"), 2)
+        for transform in ("rotate(10)", "scale(0)", "scale(nan)"):
+            with self.subTest(transform=transform), self.assertRaises(ProjectError):
+                _transform_scale(transform)
+
+    @unittest.skipUnless(shutil.which("inkscape"), "Inkscape required")
+    def test_compensated_strokes_have_actual_output_pixel_width(self):
+        ns = "{http://www.w3.org/2000/svg}"
+        root = ET.Element(ns + "svg", {"width": "100", "height": "100",
+                                       "viewBox": "0 0 100 100"})
+        outer = ET.SubElement(root, ns + "g", {"transform": "scale(5 5)"})
+        inner = ET.SubElement(outer, ns + "g", {"transform": "translate(0 20) scale(.1 -.1)"})
+        ET.SubElement(inner, ns + "path", {"d": "M40 100 L160 100"})
+        _style_paths(outer, "#ffffff", 4, 2, "#000000")
+        svg, png = self.work / "pixel-width.svg", self.work / "pixel-width.png"
+        ET.ElementTree(root).write(svg)
+        _render_svg(svg, png, 100, 100)
+        with Image.open(png) as image:
+            pixels = image.convert("RGBA")
+            colored = sum(pixels.getpixel((50, y))[0] > 200 and
+                          pixels.getpixel((50, y))[3] > 200 for y in range(100))
+            occupied = sum(pixels.getpixel((50, y))[3] > 200 for y in range(100))
+            self.assertEqual(colored, 4)
+            self.assertEqual(occupied, 8)
+
+    @unittest.skipUnless(shutil.which("inkscape"), "Inkscape required")
+    def test_real_inkscape_measures_halo_and_overlap_repositions(self):
+        ns = "{http://www.w3.org/2000/svg}"
+        root = ET.Element(ns + "svg", {"width": "200", "height": "200",
+                                       "viewBox": "0 0 200 200"})
+        for i in range(2):
+            ET.SubElement(root, ns + "use", {"id": f"label-halo-{i}",
+                          "{http://www.w3.org/1999/xlink}href": f"#label-{i}",
+                          "stroke": "black", "stroke-width": "4"})
+            ET.SubElement(root, ns + "text", {"id": f"label-{i}", "x": "100", "y": "100",
+                          "font-size": "10", "font-weight": "bold", "fill": "white",
+                          "text-anchor": "middle"}).text = "CPU"
+        svg, png = self.work / "real-halo.svg", self.work / "real-halo.png"
+        ET.ElementTree(root).write(svg)
+        component = Image.new("L", (200, 200), 255)
+        try:
+            _place_labels(root, svg, [({}, 100, 100, component)] * 2, [200, 200], 2)
+        finally:
+            component.close()
+        ET.ElementTree(root).write(svg)
+        boxes = _query_label_bounds(svg, ["label-halo-0", "label-halo-1"])
+        a, b = boxes.values()
+        self.assertTrue(a[0] + a[2] + 1.9 <= b[0] or b[0] + b[2] + 1.9 <= a[0] or
+                        a[1] + a[3] + 1.9 <= b[1] or b[1] + b[3] + 1.9 <= a[1])
+        _render_svg(svg, png, 200, 200)
+        with Image.open(png) as image:
+            self.assertIsNotNone(image.getbbox())
+
+    def test_overlap_search_preserves_component_and_holes(self):
+        mask = Image.new("L", (100, 100), 255)
+        draw = ImageDraw.Draw(mask)
+        draw.rectangle((10, 10, 60, 90), fill=0)
+        draw.rectangle((30, 30, 40, 40), fill=255)
+        draw.rectangle((70, 10, 90, 90), fill=0)
+        component = _anchor_component(mask, 25, 50, 100, 100)
+        self.addCleanup(component.close)
+        self.assertEqual(component.getpixel((35, 35)), 0)
+        self.assertEqual(component.getpixel((80, 50)), 0)
+        root = ET.Element("{http://www.w3.org/2000/svg}svg")
+        for i in range(2):
+            ET.SubElement(root, "{http://www.w3.org/2000/svg}text",
+                          {"id": f"label-{i}", "x": "25", "y": "50"}).text = "CPU"
+        labels = [({}, 25, 50, component)] * 2
+        measured = {f"label-{i}": (20, 46, 10, 8) for i in range(2)}
+        with patch("artistic.outlines._query_label_bounds", return_value=measured):
+            _place_labels(root, self.work / "placed.svg", labels, [100, 100], 0)
+        texts = list(root)
+        self.assertNotEqual(texts[0].get("y"), texts[1].get("y"))
+        for text in texts:
+            self.assertTrue(component.getpixel((int(float(text.get("x"))),
+                                                int(float(text.get("y"))))))
+        measured = {"label-0": (0, 0, 101, 101)}
+        with patch("artistic.outlines._query_label_bounds", return_value=measured):
+            with self.assertRaisesRegex(ProjectError, "reduce font_size"):
+                _place_labels(root, self.work / "failed.svg", labels[:1], [100, 100], 0)
+
+    @unittest.skipUnless(shutil.which("potrace"), "potrace required")
+    def test_contrast_svg_has_single_primary_text_and_reference_halo(self):
+        self._render_receipt()
+        settings = self.config["render"]["outlines"]
+        settings.update(stroke_width=3.2, stroke_border_width=1.6, label_color="#ffffff",
+                        label_border_width=2, font_weight="bold")
+        root = ET.parse(annotate(self.config)[0]).getroot()
+        ns = "{http://www.w3.org/2000/svg}"
+        texts, halos = root.findall(ns + "text"), root.findall(ns + "use")
+        self.assertEqual(len(texts), len(halos))
+        self.assertGreater(len(texts), 0)
+        for i, (text, halo) in enumerate(zip(texts, halos)):
+            self.assertEqual(text.get("font-weight"), "bold")
+            self.assertEqual(text.get("fill"), "#ffffff")
+            self.assertEqual(halo.get("{http://www.w3.org/1999/xlink}href"), f"#label-{i}")
+            self.assertEqual(float(halo.get("stroke-width")), 4)
+            self.assertLess(list(root).index(halo), list(root).index(text))
+        paths = list(root.iter(ns + "path"))
+        self.assertTrue(any(p.get("stroke") == "#000000" for p in paths))
+
+    @unittest.skipUnless(shutil.which("potrace"), "potrace required")
+    def test_contrast_colors_are_normalized_to_svg_rgb(self):
+        self._render_receipt()
+        settings = self.config["render"]["outlines"]
+        settings.update(label_color="hsv(120,100%,100%)", label_border_color="#ffff",
+                        stroke_border_color="#000000ff", stroke_border_width=2,
+                        label_border_width=2)
+        root = ET.parse(annotate(self.config)[0]).getroot()
+        ns = "{http://www.w3.org/2000/svg}"
+        self.assertTrue(all(t.get("fill") == "#00ff00" for t in root.findall(ns + "text")))
+        self.assertTrue(all(t.get("stroke") == "#ffffff" for t in root.findall(ns + "use")))
+        self.assertTrue(any(p.get("stroke") == "#000000" for p in root.iter(ns + "path")))
+        self.assertEqual(settings["label_color"], "hsv(120,100%,100%)")
+
+    @unittest.skipUnless(shutil.which("potrace"), "potrace required")
+    def test_failed_label_placement_does_not_replace_final_svg(self):
+        self._render_receipt()
+        settings = self.config["render"]["outlines"]
+        settings["avoid_label_overlap"] = True
+        svg = self.work / "chip_modules.svg"
+        previous = b"previous successful SVG"
+        svg.write_bytes(previous)
+        with patch("artistic.outlines._place_labels", side_effect=ProjectError("cannot place label")):
+            with self.assertRaisesRegex(ProjectError, "cannot place label"):
+                annotate(self.config)
+        self.assertEqual(svg.read_bytes(), previous)
+
+    @unittest.skipUnless(shutil.which("potrace"), "potrace required")
+    def test_overlap_anchors_use_the_component_raster(self):
+        self.config["render"]["resolution"] = [512, 512]
+        self._render_receipt(resolution=[512, 512])
+        self.config["render"]["outlines"].update(resolution=512, avoid_label_overlap=True)
+
+        def diagonal_trace(mask, path, minimum):
+            ImageDraw.Draw(mask).rectangle((0, 0, 511, 511), fill=1)
+            ImageDraw.Draw(mask).line((128, 128, 384, 384), fill=0)
+            return _trace(mask, path, minimum)
+
+        # Label placement is tested separately: this isolates actual Potrace sampling.
+        with patch("artistic.outlines._trace", side_effect=diagonal_trace), \
+                patch("artistic.outlines._trace_anchors", side_effect=AssertionError("different raster")), \
+                patch("artistic.outlines._place_labels") as place:
+            annotate(self.config)
+        labels = place.call_args.args[2]
+        self.assertGreater(len(labels), 1)
+
+    def test_overlap_avoidance_rejects_unbounded_trace_resolution(self):
+        self.config["render"]["outlines"].update(resolution=513, avoid_label_overlap=True)
+        with self.assertRaisesRegex(ProjectError, "at most 512"):
+            _options(self.config)
+        self.config["render"]["outlines"]["avoid_label_overlap"] = False
+        _options(self.config)
+
+    @unittest.skipUnless(shutil.which("potrace"), "potrace required")
+    def test_failed_svg_serialization_keeps_previous_shadow_and_svg(self):
+        self._render_receipt()
+        record_path = self.work / "render.json"
+        record = json.loads(record_path.read_text())
+        record["layout"] = {"bbox_um": [50, 90, 150, 190]}
+        write_json(record_path, record)
+        receipt_path = self.work / "render_output.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["render_record_sha256"] = sha256(record_path)
+        write_json(receipt_path, receipt)
+        self.config["render"]["shadow"] = {"padding_px": 10}
+        svg, shadow = self.work / "chip_modules.svg", self.work / "chip_shadow.png"
+        svg.write_bytes(b"previous SVG")
+        shadow.write_bytes(b"previous shadow")
+        with patch("artistic.outlines.ET.ElementTree.write", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                annotate(self.config)
+        self.assertEqual(svg.read_bytes(), b"previous SVG")
+        self.assertEqual(shadow.read_bytes(), b"previous shadow")
+
+    @unittest.skipUnless(shutil.which("potrace"), "potrace required")
+    def test_shadow_can_toggle_after_composition_with_either_base_filename(self):
+        self._render_receipt()
+        record_path = self.work / "render.json"
+        record = json.loads(record_path.read_text())
+        record["layout"] = {"bbox_um": [50, 90, 150, 190]}
+        write_json(record_path, record)
+        receipt_path = self.work / "render_output.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["render_record_sha256"] = sha256(record_path)
+        shutil.copyfile(self.work / "chip_render.png", self.work / "chip_render_base.png")
+        for image in ("chip_render.png", "chip_render_base.png"):
+            receipt["image"] = image
+            write_json(receipt_path, receipt)
+            for enabled in (True, False):
+                self.config["render"]["shadow"] = {"enabled": enabled, "padding_px": 10}
+                root = ET.parse(annotate(self.config)[0]).getroot()
+                self.assertEqual(int(root.get("width")), 120 if enabled else 100)
+
+    @unittest.skipUnless(shutil.which("inkscape") and shutil.which("potrace"),
+                         "Inkscape and potrace required")
+    def test_advanced_annotation_exports_png_and_keeps_labels_in_region(self):
+        self._render_receipt(background="#445566")
+        (self.root / "macro.lef").write_text(LEF.replace("SIZE 10 BY 4", "SIZE 60 BY 60"))
+        settings = self.config["render"]["outlines"]
+        settings.update(formats=["svg", "png"], font_size=10, stroke_width=3.2,
+                        stroke_border_width=1.6, label_color="white",
+                        label_border_width=2, font_weight="bold", avoid_label_overlap=True)
+        outputs = annotate(self.config)
+        self.assertEqual([p.suffix for p in outputs], [".svg", ".png"])
+        root = ET.parse(outputs[0]).getroot()
+        ns = "{http://www.w3.org/2000/svg}"
+        texts = root.findall(ns + "text")
+        self.assertEqual(len(texts), 1)
+        x, y = float(texts[0].get("x")), float(texts[0].get("y"))
+        self.assertTrue(10 < x < 70 and 10 < y < 80)
+        bounds = _query_label_bounds(outputs[0], ["label-halo-0"])["label-halo-0"]
+        self.assertTrue(bounds[0] >= 2 and bounds[1] >= 2)
+        self.assertTrue(bounds[0] + bounds[2] <= 98 and bounds[1] + bounds[3] <= 98)
+        with Image.open(outputs[1]) as image:
+            self.assertEqual(image.size, (100, 100))
+
+    @unittest.skipUnless(shutil.which("potrace"), "potrace required")
+    def test_non_square_render_with_rounded_trace_dimensions(self):
+        self.config["render"]["resolution"] = [1234, 987]
+        self._render_receipt()
+        record_path = self.work / "render.json"
+        record = json.loads(record_path.read_text())
+        record["resolution"] = [1234, 987]
+        write_json(record_path, record)
+        image = self.work / "chip_render.png"
+        Image.new("RGB", (1234, 987), "white").save(image)
+        receipt_path = self.work / "render_output.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt.update(resolution=[1234, 987], image_sha256=sha256(image),
+                       render_record_sha256=sha256(record_path),
+                       composition_sha256=composition_hash(self.config, record))
+        write_json(receipt_path, receipt)
+        self.config["render"]["outlines"].update(resolution=140, stroke_border_width=1.6)
+        root = ET.parse(annotate(self.config)[0]).getroot()
+        self.assertEqual(root.get("viewBox"), "0 0 1234 987")
+
     def test_labels_accept_path_separators_as_text(self):
         spec = self.config["render"]["outlines"]["modules"]["i_uart"]
         spec["label"] = "I/O & CPU/DMA"
@@ -96,13 +378,14 @@ class OutlineTests(unittest.TestCase):
                                                            "color": "#ff8800"}}}},
         }
 
-    def _render_receipt(self, viewport=None, background="white"):
+    def _render_receipt(self, viewport=None, background="white", resolution=None):
         viewport = viewport or [50, 90, 150, 190]
+        resolution = resolution or [100, 100]
         image = self.work / "chip_render.png"
         mode = "RGBA" if isinstance(background, tuple) and len(background) == 4 else "RGB"
-        Image.new(mode, (100, 100), background).save(image)
+        Image.new(mode, tuple(resolution), background).save(image)
         source = self.root / "chip.gds"
-        record = {"record_version": 2, "chip": "chip", "resolution": [100, 100],
+        record = {"record_version": 2, "chip": "chip", "resolution": resolution,
                   "gds": {"viewport_um": viewport},
                   "input": work_relative(self.config, source),
                   "input_sha256": sha256(source),
@@ -116,7 +399,7 @@ class OutlineTests(unittest.TestCase):
                    "generation_sha256": record["generation_sha256"],
                    "composition_sha256": composition_hash(self.config, record),
                    "source_sha256": record["input_sha256"],
-                   "resolution": [100, 100], "viewport_um": viewport}
+                   "resolution": resolution, "viewport_um": viewport}
         write_json(self.work / "render_output.json", receipt)
 
     def test_units_multiline_def_and_lef_orientation(self):
@@ -484,6 +767,86 @@ END DESIGN
             self.assertEqual(jpg.size, (100, 100))
             self.assertEqual(png.convert("RGBA").getpixel((0, 0)), (163, 66, 245, 255))
         self.assertTrue(outputs[1].read_bytes().startswith(b"%PDF"))
+
+    @unittest.skipUnless(shutil.which("potrace") and shutil.which("inkscape"),
+                         "potrace and Inkscape are required")
+    def test_chip_shadow_exports_and_unshifted_label_coordinates(self):
+        self._render_receipt(background="#a342f5")
+        self.config["render"]["shadow"] = {
+            "padding_px": 10, "blur_px": 2, "offset_px": [2, 4]}
+        self.config["render"]["outlines"]["formats"] = ["svg", "png", "jpg", "pdf"]
+        record_path = self.work / "render.json"
+        record = json.loads(record_path.read_text())
+        record["layout"] = {"bbox_um": [50, 90, 150, 190]}
+        write_json(record_path, record)
+        receipt_path = self.work / "render_output.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["render_record_sha256"] = sha256(record_path)
+        write_json(receipt_path, receipt)
+        outputs = annotate(self.config)
+        root = ET.parse(outputs[0]).getroot()
+        self.assertEqual(root.get("viewBox"), "-10 -10 120 120")
+        self.assertEqual(root.get("width"), "120")
+        images = root.findall("{http://www.w3.org/2000/svg}image")
+        self.assertEqual(images[0].get("{http://www.w3.org/1999/xlink}href"), "chip_shadow.png")
+        self.assertEqual(images[1].get("{http://www.w3.org/1999/xlink}href"), "chip_render.png")
+        anchors = [(node.get("x"), node.get("y"))
+                   for node in root.findall("{http://www.w3.org/2000/svg}text")]
+        for path in outputs[1:3]:
+            with Image.open(path) as image:
+                self.assertEqual(image.size, (120, 120))
+        self.assertTrue(outputs[3].read_bytes().startswith(b"%PDF"))
+        self.config["render"]["shadow"]["enabled"] = False
+        plain = ET.parse(annotate(self.config)[0]).getroot()
+        self.assertEqual(plain.get("viewBox"), "0 0 100 100")
+        self.assertEqual(anchors, [(node.get("x"), node.get("y"))
+                                  for node in plain.findall("{http://www.w3.org/2000/svg}text")])
+
+    @unittest.skipUnless(shutil.which("inkscape"), "Inkscape is required")
+    def test_shadow_alpha_matches_composition_inside_and_outside_footprint(self):
+        self.config["palettes"] = {"test": {"background": "#33669980"}}
+        self.config["render"]["palette"] = "test"
+        self.config["render"]["shadow"] = {
+            "padding_px": 10, "blur_px": 2, "offset_px": [2, 4]}
+        self.config["render"]["outlines"].update(font_size=0, formats=["png", "pdf"])
+        self._render_receipt(background=(51, 102, 153, 128))
+        record_path = self.work / "render.json"
+        record = json.loads(record_path.read_text())
+        record["layout"] = {"bbox_um": [70, 110, 130, 170]}
+        write_json(record_path, record)
+        receipt_path = self.work / "render_output.json"
+        receipt = json.loads(receipt_path.read_text())
+        receipt["render_record_sha256"] = sha256(record_path)
+        write_json(receipt_path, receipt)
+        with patch("artistic.outlines._trace", return_value=ET.Element(
+                "{http://www.w3.org/2000/svg}svg", {"viewBox": "0 0 50 50"})):
+            png = annotate(self.config)[0]
+        with Image.open(self.work / "chip_render.png") as base:
+            expected = decorate(base, self.config["render"], record, (51, 102, 153, 128))
+        try:
+            with Image.open(png) as actual:
+                # Inkscape's premultiplied colors can round by two; alpha by one.
+                for point in ((1, 1), (20, 20), (29, 50), (30, 50), (60, 60), (95, 60)):
+                    for channel, (observed, target) in enumerate(zip(
+                            actual.convert("RGBA").getpixel(point), expected.getpixel(point))):
+                        self.assertLessEqual(abs(observed - target), 1 if channel == 3 else 2, point)
+            if shutil.which("pdftoppm"):
+                raster = self.work / "pdf-shadow"
+                subprocess.run(["pdftoppm", "-r", "96", "-png", "-singlefile",
+                                str(png.with_suffix(".pdf")), str(raster)],
+                               check=True, capture_output=True)
+                flattened = Image.new("RGBA", expected.size, "white")
+                flattened.alpha_composite(expected)
+                try:
+                    with Image.open(raster.with_suffix(".png")) as pdf_image:
+                        for point in ((5, 5), (20, 20), (60, 60), (110, 110)):
+                            for observed, target in zip(pdf_image.convert("RGB").getpixel(point),
+                                                        flattened.convert("RGB").getpixel(point)):
+                                self.assertLessEqual(abs(observed - target), 1, point)
+                finally:
+                    flattened.close()
+        finally:
+            expected.close()
 
     @unittest.skipUnless(shutil.which("potrace"), "potrace is unavailable")
     def test_verified_image_respects_recorded_pixel_limit(self):

@@ -67,6 +67,19 @@ class InspectionTests(unittest.TestCase):
         report["palette_preview"] = "chip_palette.svg"
         self.assertIn("Palette preview: chip_palette.svg", format_summary(report))
 
+    def test_shadow_padding_is_in_output_dimensions_and_pdf_report(self):
+        self.config["render"]["shadow"] = {"padding_px": 20}
+        report = analyze(self.config, self.manifest)
+        render = report["render"]
+        self.assertEqual(render["resolution"], [200, 100])
+        self.assertEqual(render["output_resolution"], [240, 140])
+        self.assertAlmostEqual(render["page_cm"][0], 240 / 14)
+        self.assertEqual(render["page_cm"][1], 10)
+        self.assertAlmostEqual(render["dpi"], 35.56)
+        self.assertEqual(render["nm_per_px"], 100)
+        self.assertEqual(report["map"]["resolution"], [100, 200])
+        self.assertIn("With shadow padding: 240 x 140 px", format_summary(report))
+
     def test_explicit_viewport_and_margin(self):
         self.config["render"]["viewport_um"] = [10, 20, 50, 30]
         self.assertEqual(analyze(self.config, self.manifest)["render"]["viewport_um"],

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .image_outputs import pdf_geometry
 from .palettes import background_rgba, palette
+from .presentation import presentation_geometry
 from .project import _project_name
 from .render import _viewport, resolve_dimensions, resolve_viewport
 from .technology import selected_layers
@@ -40,7 +41,10 @@ def analyze(config: dict, manifest: dict) -> dict:
                                      dimensions["raw_resolution"][0],
                    "layers_resolved": [name for name, _, _ in selected]}
         if section == "render":
-            page = pdf_geometry(resolution, settings)
+            presentation = presentation_geometry(settings, {"resolution": resolution,
+                "layout": section_layout, "gds": {"viewport_um": viewport}})
+            metrics["output_resolution"] = presentation["size"]
+            page = pdf_geometry(presentation["size"], settings)
             metrics.update({name: page[name] for name in ("dpi", "page_cm", "image_cm")})
         report[section] = metrics
     return report
@@ -72,6 +76,9 @@ def format_summary(report: dict) -> str:
             "  Layers: " + (", ".join(metrics["layers_resolved"]) or "none"),
         ])
         if section == "render":
+            if metrics["output_resolution"] != resolution:
+                output = metrics["output_resolution"]
+                lines.append(f"  With shadow padding: {output[0]} x {output[1]} px")
             width, height = metrics["page_cm"]
             lines.append(f"  PDF page: {width:g} x {height:g} cm; {metrics['dpi']:g} dpi")
     if report.get("palette_preview"):
