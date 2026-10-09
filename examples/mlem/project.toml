@@ -30,6 +30,13 @@ palette = "mlem"
 formats = ["png", "jpg", "pdf"]
 page_width_cm = 84.1
 
+[render.shadow]
+enabled = true
+opacity = 0.28
+blur_px = 35.2
+offset_px = [15.4, 26.4]
+padding_px = 176
+
 [render.poster]
 grid = [2, 2]
 page_size_mm = [210, 297]
@@ -41,10 +48,16 @@ def = "mlem.def.gz"
 lef_files = ["mlem_macros.lef"]
 resolution = 140
 min_area_pixels = 50
-background_opacity = 0.65
-font_size = 28
-stroke_width = 1.5
-label_lightness = 0.25
+background_opacity = 1
+font_size = 61.6
+font_weight = "bold"
+label_color = "#ffffff"
+label_border_color = "#000000"
+label_border_width = 4.4
+avoid_label_overlap = true
+stroke_width = 7.04
+stroke_border_color = "#000000"
+stroke_border_width = 3.52
 formats = ["svg", "png", "jpg", "pdf"]
 
 [render.outlines.modules]
