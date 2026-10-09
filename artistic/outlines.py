@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import colorsys
+import copy
 import glob
 import gzip
 import hashlib
@@ -26,6 +27,7 @@ from PIL import Image, ImageColor, ImageDraw
 
 from .image_outputs import jpeg_background, jpeg_image
 from .palettes import background_rgba, palette
+from .presentation import presentation_geometry, shadow_image, shadow_options
 from .project import (ProjectError, _project_name, filename_component, input_gds,
                       recorded_path, run_checked, sha256, tool, work_relative)
 from .render import _pixel_limit, composition_hash, generation_hash
@@ -202,6 +204,7 @@ def _options(config: dict) -> tuple[dict, Path, list[Path], dict, list[str]]:
     settings = config.get("render", {}).get("outlines")
     if not isinstance(settings, dict):
         raise ProjectError("[render.outlines] is not configured")
+    settings = dict(settings)
     if settings.get("enabled", True) is False:
         raise ProjectError("[render.outlines] is disabled")
     if not settings.get("def"):
@@ -246,6 +249,29 @@ def _options(config: dict) -> tuple[dict, Path, list[Path], dict, list[str]]:
             raise ProjectError("outline hierarchy depths must be positive integers with min_depth <= max_depth")
     if "background" in settings:
         background_rgba(settings["background"])
+    for name in ("stroke_border_width", "label_border_width"):
+        value = settings.get(name, 0)
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value) and value >= 0
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ProjectError(f"[render.outlines].{name} must be a finite nonnegative number")
+    for name in ("stroke_border_color", "label_border_color", "label_color"):
+        value = settings.get(name, None if name == "label_color" else "#000000")
+        if value is None and name == "label_color":
+            continue
+        try:
+            rgba = ImageColor.getcolor(value, "RGBA") if isinstance(value, str) else None
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ProjectError(f"[render.outlines].{name} must be an opaque color") from exc
+        if rgba is None or rgba[3] != 255:
+            raise ProjectError(f"[render.outlines].{name} must be an opaque color")
+        settings[name] = "#%02x%02x%02x" % rgba[:3]
+    if settings.get("font_weight", "normal") not in ("normal", "bold"):
+        raise ProjectError("[render.outlines].font_weight must be normal or bold")
+    if type(settings.get("avoid_label_overlap", False)) is not bool:
+        raise ProjectError("[render.outlines].avoid_label_overlap must be a boolean")
     for pattern, spec in modules.items():
         if not isinstance(pattern, str) or not pattern or not isinstance(spec, dict):
             raise ProjectError("invalid [render.outlines.modules] entry")
@@ -272,6 +298,9 @@ def _options(config: dict) -> tuple[dict, Path, list[Path], dict, list[str]]:
             not all(math.isfinite(v) for v in (opacity, font_size, stroke, lightness)) or
             not 0 <= opacity <= 1 or font_size < 0 or stroke <= 0 or not 0 <= lightness <= 1):
         raise ProjectError("[render.outlines] numeric settings are out of range")
+    if settings.get("avoid_label_overlap", False) and resolution > 512:
+        raise ProjectError("avoid_label_overlap requires outline resolution at most 512; "
+                           "reduce resolution or disable overlap avoidance")
     formats = settings.get("formats", ["svg"])
     if not isinstance(formats, list) or not formats or any(
             not isinstance(v, str) or v.lower() not in ("svg", "png", "pdf", "jpg")
@@ -481,10 +510,187 @@ def _region_anchors(mask: Image.Image) -> list[tuple[float, float]]:
     return anchors
 
 
+def _transform_scale(transform: str) -> float:
+    """Measure the combined scale of Potrace transforms."""
+    scale, end = 1.0, 0
+    for match in re.finditer(r"(translate|scale)\s*\(([^)]*)\)", transform):
+        if transform[end:match.start()].strip(" ,\t\n"):
+            raise ProjectError(f"unsupported outline transform: {transform}")
+        try:
+            values = [float(v) for v in re.split(r"[\s,]+", match[2].strip())]
+        except ValueError as exc:
+            raise ProjectError(f"invalid outline transform: {transform}") from exc
+        if len(values) not in (1, 2) or not all(math.isfinite(v) for v in values):
+            raise ProjectError(f"invalid outline transform: {transform}")
+        if match[1] == "scale":
+            sx, sy = values[0], values[-1]
+            if not sx or not sy:
+                raise ProjectError(f"zero outline scale is unsupported: {transform}")
+            # Raster rounding can give slightly different x/y scales.
+            scale *= math.sqrt(abs(sx * sy))
+        end = match.end()
+    if transform[end:].strip(" ,\t\n") or not math.isfinite(scale) or not scale:
+        raise ProjectError(f"unsupported outline transform: {transform}")
+    return scale
+
+
+def _style_paths(node: ET.Element, color: str, stroke: float, border: float,
+                 border_color: str, scale: float = 1) -> None:
+    scale *= _transform_scale(node.get("transform", ""))
+    for child in list(node):
+        if child.tag == f"{{{SVG}}}path":
+            path_scale = scale * _transform_scale(child.get("transform", ""))
+            child.set("fill", "none")
+            child.set("stroke", color)
+            child.set("stroke-width", str(stroke / path_scale))
+            child.set("stroke-linejoin", "round")
+            child.set("stroke-linecap", "round")
+            child.attrib.pop("vector-effect", None)
+            if border:
+                under = copy.deepcopy(child)
+                under.attrib.pop("id", None)
+                under.set("stroke", border_color)
+                under.set("stroke-width", str((stroke + 2 * border) / path_scale))
+                node.insert(list(node).index(child), under)
+        else:
+            _style_paths(child, color, stroke, border, border_color, scale)
+
+
+def _anchor_component(mask: Image.Image, x: float, y: float,
+                      width: int, height: int) -> Image.Image:
+    """Retain only the anchor's traced region, including its holes."""
+    region = mask.convert("L")
+    seed = (min(region.width - 1, max(0, int(x * region.width / width))),
+            min(region.height - 1, max(0, int(y * region.height / height))))
+    if region.getpixel(seed) >= 128:
+        region.close()
+        raise ProjectError("outline label anchor is outside its traced region")
+    binary = region.point(lambda v: 0 if v < 128 else 255)
+    region.close()
+    region = binary
+    ImageDraw.floodfill(region, seed, 128)
+    component = region.point(lambda v: 255 if v == 128 else 0)
+    region.close()
+    return component
+
+
+def _query_label_bounds(svg: Path, identifiers: list[str]) -> dict:
+    try:
+        result = subprocess.run([tool("inkscape"), str(svg), "--query-all"],
+                                check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ProjectError("Inkscape could not measure outline labels") from exc
+    bounds = {}
+    for line in result.stdout.splitlines():
+        fields = line.split(",")
+        if fields[0] not in identifiers:
+            continue
+        try:
+            values = tuple(float(v) for v in fields[1:])
+        except ValueError as exc:
+            raise ProjectError("Inkscape returned invalid outline label bounds") from exc
+        if (len(values) != 4 or not all(math.isfinite(v) for v in values) or
+                values[2] <= 0 or values[3] <= 0):
+            raise ProjectError("Inkscape returned invalid outline label bounds")
+        bounds[fields[0]] = values
+    if set(bounds) != set(identifiers):
+        raise ProjectError("Inkscape did not return bounds for every outline label")
+    return bounds
+
+
+def _place_labels(root: ET.Element, svg: Path, labels: list, resolution: list[int],
+                  border: float) -> None:
+    identifiers = [f"label-halo-{i}" if border else f"label-{i}" for i in range(len(labels))]
+    bounds = _query_label_bounds(svg, identifiers)
+    width, height = resolution
+    accepted = []
+    radius = max(width, height) / 10
+    step = max(1, 4 * max(width, height) / 1000)
+    offsets = [(0., 0.)]
+    offsets.extend((dx * step, dy * step)
+                   for dy in range(-math.ceil(radius / step), math.ceil(radius / step) + 1)
+                   for dx in range(-math.ceil(radius / step), math.ceil(radius / step) + 1)
+                   if 0 < (dx * step)**2 + (dy * step)**2 <= radius**2)
+    offsets.sort(key=lambda p: (p[0]**2 + p[1]**2, p[1], p[0]))
+    texts = root.findall(f"{{{SVG}}}text")
+    for i, (_, x, y, component) in enumerate(labels):
+        bx, by, bw, bh = bounds[identifiers[i]]
+        for dx, dy in offsets:
+            nx, ny = x + dx, y + dy
+            if not 0 <= nx < width or not 0 <= ny < height:
+                continue
+            if not component.getpixel((int(nx * component.width / width),
+                                       int(ny * component.height / height))):
+                continue
+            box = (bx + dx, by + dy, bx + dx + bw, by + dy + bh)
+            if box[0] < 2 or box[1] < 2 or box[2] > width - 2 or box[3] > height - 2:
+                continue
+            if any(not (box[2] + 2 <= other[0] or other[2] + 2 <= box[0] or
+                        box[3] + 2 <= other[1] or other[3] + 2 <= box[1]) for other in accepted):
+                continue
+            texts[i].set("x", str(nx))
+            texts[i].set("y", str(ny))
+            accepted.append(box)
+            break
+        else:
+            raise ProjectError(f"cannot place outline label {texts[i].text!r} without overlap "
+                               "inside its traced region; reduce font_size or label_border_width")
+
+
+def _add_chip_shadow(root: ET.Element, config: dict, record: dict,
+                     temporary: Path) -> list[int]:
+    render = config.get("render", {})
+    geometry = presentation_geometry(render, record)
+    if shadow_options(render) is None:
+        return geometry["size"]
+    padding = geometry["padding"]
+    width, height = geometry["size"]
+    root.set("width", str(width))
+    root.set("height", str(height))
+    root.set("viewBox", f"{-padding} {-padding} {width} {height}")
+    background = root.find(f"{{{SVG}}}rect")
+    background.attrib.update(x=str(-padding), y=str(-padding),
+                             width=str(width), height=str(height))
+    image = root.find(f"{{{SVG}}}image")
+    left, top, right, bottom = geometry["box"]
+    definitions = ET.SubElement(root, f"{{{SVG}}}defs")
+    clip = ET.SubElement(definitions, f"{{{SVG}}}clipPath", {"id": "chip-footprint"})
+    ET.SubElement(clip, f"{{{SVG}}}rect", {"x": str(left), "y": str(top),
+                  "width": str(right - left), "height": str(bottom - top)})
+    settings = render.get("outlines", {})
+    backdrop = background_rgba(palette(config, render, [], routing=[])["background"])
+    if "background" not in settings and 0 < backdrop[3] < 255:
+        # Avoid blending the translucent background into the chip twice.
+        outside = ET.SubElement(definitions, f"{{{SVG}}}clipPath", {"id": "chip-surround"})
+        ET.SubElement(outside, f"{{{SVG}}}path", {
+            "d": (f"M {-padding} {-padding} h {width} v {height} h {-width} Z "
+                  f"M {left} {top} v {bottom - top} h {right - left} v {top - bottom} Z"),
+            "clip-rule": "evenodd", "fill-rule": "evenodd",
+        })
+        background.set("fill", "#" + "".join(f"{value:02x}" for value in backdrop[:3]))
+        background.set("fill-opacity", str(backdrop[3] / 255))
+        background.set("clip-path", "url(#chip-surround)")
+    image.set("clip-path", "url(#chip-footprint)")
+    path = temporary / f"{_project_name(config)}_shadow.png"
+    shadow = shadow_image(render, record)
+    try:
+        shadow.save(path)
+    finally:
+        shadow.close()
+    root.insert(list(root).index(image), ET.Element(f"{{{SVG}}}image", {
+        f"{{{XLINK}}}href": path.name, "x": str(-padding), "y": str(-padding),
+        "width": str(width), "height": str(height),
+    }))
+    return geometry["size"]
+
+
 def annotate(config: dict) -> list[Path]:
     """Annotate a verified composed render without re-rendering its GDS."""
     settings, def_file, lef_files, modules, formats = _options(config)
     image, resolution, viewport = _receipt(config)
+    work = Path(config["design"]["work_dir"])
+    record = json.loads((work / "render.json").read_text())
+    output_size = presentation_geometry(config.get("render", {}), record)["size"]
     jpeg_matte = jpeg_background(config.get("render", {})) if "jpg" in formats else None
     placements = _offset_placements(_def_placements(def_file, _lef_sizes(lef_files)),
                                     settings.get("offset_um", [0, 0]))
@@ -510,7 +716,6 @@ def annotate(config: dict) -> list[Path]:
                   "width": str(width), "height": str(height),
                   "opacity": str(settings.get("background_opacity", 1))})
     labels = []
-    work = Path(config["design"]["work_dir"])
     with tempfile.TemporaryDirectory(prefix="outline-", dir=work) as temporary:
         for index, (pattern, spec) in enumerate(modules.items()):
             boxes = [_pixel_box(box, canvas, resolution) for box in groups.get(pattern, ())]
@@ -536,28 +741,73 @@ def annotate(config: dict) -> list[Path]:
             for child in traced:
                 if child.tag == f"{{{SVG}}}g":
                     outer.append(child)
-            for path in outer.iter(f"{{{SVG}}}path"):
-                path.set("fill", "none")
-                path.set("stroke", spec["color"])
-                path.set("stroke-width", str(settings.get("stroke_width", 1)))
-                path.set("vector-effect", "non-scaling-stroke")
+            _style_paths(outer, spec["color"], float(settings.get("stroke_width", 1)),
+                         settings.get("stroke_border_width", 0),
+                         settings.get("stroke_border_color", "#000000"))
             if traced.find(f".//{{{SVG}}}path") is not None and float(settings.get("font_size", 14)):
-                labels.extend((spec, x * width / mask.width, y * height / mask.height)
-                              for x, y in _trace_anchors(mask, trace_path,
-                                                        settings.get("min_area_pixels", 50)))
+                filled = None
+                if settings.get("avoid_label_overlap", False):
+                    raster = trace_path.with_suffix(".pgm")
+                    if not raster.is_file():
+                        raster = _trace_raster(mask, trace_path, settings.get("min_area_pixels", 50))
+                    with _pixel_limit(mask.width * mask.height * 16):
+                        with Image.open(raster) as source:
+                            filled = source.convert("L")
+                    # Derive anchors and component masks from the same raster.
+                    anchors = [(ax * mask.width / filled.width, ay * mask.height / filled.height)
+                               for ax, ay in _region_anchors(filled)]
+                else:
+                    anchors = _trace_anchors(mask, trace_path, settings.get("min_area_pixels", 50))
+                try:
+                    for ax, ay in anchors:
+                        x, y = ax * width / mask.width, ay * height / mask.height
+                        component = (_anchor_component(filled, x, y, width, height)
+                                     if filled is not None else None)
+                        labels.append((spec, x, y, component))
+                finally:
+                    if filled is not None:
+                        filled.close()
             mask.close()
-        for spec, x, y in labels:
+        for index, (spec, x, y, _) in enumerate(labels):
             if float(settings.get("font_size", 14)):
+                border = settings.get("label_border_width", 0)
+                if border:
+                    ET.SubElement(root, f"{{{SVG}}}use", {
+                        "id": f"label-halo-{index}", f"{{{XLINK}}}href": f"#label-{index}",
+                        "stroke": settings.get("label_border_color", "#000000"),
+                        "stroke-width": str(2 * border), "stroke-linejoin": "round",
+                    })
                 text = ET.SubElement(root, f"{{{SVG}}}text", {
+                    "id": f"label-{index}",
                     "x": str(x), "y": str(y), "text-anchor": "middle",
                     "dominant-baseline": "middle", "font-family": "sans-serif",
+                    "font-weight": settings.get("font_weight", "normal"),
                     "font-size": str(settings.get("font_size", 14)),
-                    "fill": _label_color(spec["color"], float(settings.get("label_lightness", .85))),
+                    "fill": settings.get("label_color") or _label_color(
+                        spec["color"], float(settings.get("label_lightness", .85))),
                 })
                 text.text = spec["label"]
         stem = filename_component(_project_name(config) + "_modules", "outline output")
         svg = work / f"{stem}.svg"
-        ET.ElementTree(root).write(svg, encoding="utf-8", xml_declaration=True)
+        try:
+            if settings.get("avoid_label_overlap", False) and labels:
+                measurement = Path(temporary) / "labels.svg"
+                measured_root = copy.deepcopy(root)
+                measured_root.find(f"{{{SVG}}}image").set(f"{{{XLINK}}}href", str(image.resolve()))
+                ET.ElementTree(measured_root).write(measurement, encoding="utf-8", xml_declaration=True)
+                _place_labels(root, measurement, labels, resolution,
+                              settings.get("label_border_width", 0))
+        finally:
+            for _, _, _, component in labels:
+                if component is not None:
+                    component.close()
+        _add_chip_shadow(root, config, record, Path(temporary))
+        staged_svg = Path(temporary) / svg.name
+        ET.ElementTree(root).write(staged_svg, encoding="utf-8", xml_declaration=True)
+        staged_shadow = Path(temporary) / f"{_project_name(config)}_shadow.png"
+        if staged_shadow.is_file():
+            staged_shadow.replace(work / staged_shadow.name)
+        staged_svg.replace(svg)
         outputs = []
         generated_png = False
         for fmt in formats:
@@ -581,9 +831,9 @@ def annotate(config: dict) -> list[Path]:
                     except subprocess.CalledProcessError as exc:
                         raise ProjectError("Inkscape failed to export JPG source") from exc
                     generated_png = True
-                with _pixel_limit(width * height):
+                with _pixel_limit(output_size[0] * output_size[1]):
                     with Image.open(png) as rendered:
-                        if rendered.size != (width, height):
+                        if rendered.size != tuple(output_size):
                             raise ProjectError("annotated PNG dimensions differ from render record")
                         rgba = rendered.convert("RGBA")
                         try:

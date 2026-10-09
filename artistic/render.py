@@ -18,6 +18,7 @@ from .project import (ProjectError, _project_name, filename_component, input_gds
 from .image_outputs import (_pdf_modules, jpeg_background, jpeg_image, pdf_geometry,
                             poster_options, write_pdf, write_poster)
 from .palettes import background_rgba
+from .presentation import decorate, presentation_geometry, shadow_options
 from .technology import inspect_layout, palette, selected_layers, run_pya
 
 
@@ -385,7 +386,9 @@ def compose(config: dict) -> list[Path]:
     colors = palette(config, render, selected, routing=routing)
     background = background_rgba(colors.pop("background"))
     resolution = tuple(settings["resolution"])
-    pdf = pdf_geometry(resolution, render)
+    presentation = presentation_geometry(render, settings)
+    shadow = shadow_options(render)
+    pdf = pdf_geometry(presentation["size"], render)
     formats = render.get("formats", ["png", "jpg", "pdf"])
     if not isinstance(formats, list):
         raise ProjectError("[render].formats must be a list")
@@ -481,26 +484,34 @@ def compose(config: dict) -> list[Path]:
                     segment.close()
     outputs = []
     png_target = None
+    exported = image
     try:
+        if shadow is not None:
+            with _pixel_limit(image.width * image.height):
+                exported = decorate(image, render, settings, background)
+            if "png" in suffixes:
+                png_target = work / f"{_project_name(config)}_render_base.png"
+                image.save(png_target)
         for suffix in suffixes:
             target = work / f"{_project_name(config)}_render.{suffix}"
             if suffix == "pdf":
-                with _pixel_limit(image.width * image.height):
-                    write_pdf(image, target, pdf["dpi"], pdf["page_size_pt"])
+                with _pixel_limit(exported.width * exported.height):
+                    write_pdf(exported, target, pdf["dpi"], pdf["page_size_pt"])
             elif suffix in ("jpg", "jpeg"):
-                converted = jpeg_image(image, jpeg_matte)
+                converted = jpeg_image(exported, jpeg_matte)
                 try:
                     converted.save(target, quality=95)
                 finally:
                     converted.close()
             else:
-                image.save(target)
-                png_target = target
+                exported.save(target)
+                if shadow is None:
+                    png_target = target
             outputs.append(target)
         if poster is not None:
             target = work / f"{_project_name(config)}_poster.pdf"
-            with _pixel_limit(image.width * image.height):
-                write_poster(image, target, poster)
+            with _pixel_limit(exported.width * exported.height):
+                write_poster(exported, target, poster)
             outputs.append(target)
         if png_target is not None:
             write_json(receipt, {"version": 2, "image": work_relative(config, png_target),
@@ -512,5 +523,7 @@ def compose(config: dict) -> list[Path]:
                                  "resolution": list(resolution),
                                  "viewport_um": settings.get("gds", {}).get("viewport_um")})
     finally:
+        if exported is not image:
+            exported.close()
         image.close()
     return outputs
