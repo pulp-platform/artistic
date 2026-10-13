@@ -45,12 +45,14 @@ def _project_path(config: dict, value: str) -> Path:
     return (path if path.is_absolute() else root / path).resolve()
 
 
-def _lef_sizes(paths: list[Path]) -> dict[str, tuple[float, float]]:
+def _lef_sizes(paths: list[Path], blocks_only: bool = False) -> dict[str, tuple[float, float]]:
     sizes = {}
     for path in paths:
         data = path.read_text()
         for match in re.finditer(r"\bMACRO\s+(\S+)(.*?)(?=\bEND\s+\1\b)",
                                  data, re.I | re.S):
+            if blocks_only and not re.search(r"\bCLASS\s+BLOCK\b", match[2], re.I):
+                continue
             size = re.search(r"\bSIZE\s+([\d.]+)\s+BY\s+([\d.]+)\s*;",
                              match[2], re.I)
             if size:
@@ -207,6 +209,18 @@ def _options(config: dict) -> tuple[dict, Path, list[Path], dict, list[str]]:
     settings = dict(settings)
     if settings.get("enabled", True) is False:
         raise ProjectError("[render.outlines] is disabled")
+    if settings.get("method", "placement") not in ("placement", "density"):
+        raise ProjectError("[render.outlines].method must be placement or density")
+    for name, default, maximum in (("fill_opacity", 0, 1), ("smoothing_px", 12, None)):
+        value = settings.get(name, default)
+        try:
+            valid = (type(value) in (int, float) and math.isfinite(value) and value >= 0 and
+                     (maximum is None or value <= maximum) and
+                     (name != "smoothing_px" or value > 0))
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ProjectError(f"[render.outlines].{name} is out of range")
     if not settings.get("def"):
         raise ProjectError("[render.outlines].def is required")
     offset = settings.get("offset_um", [0, 0])
@@ -301,6 +315,8 @@ def _options(config: dict) -> tuple[dict, Path, list[Path], dict, list[str]]:
     if settings.get("avoid_label_overlap", False) and resolution > 512:
         raise ProjectError("avoid_label_overlap requires outline resolution at most 512; "
                            "reduce resolution or disable overlap avoidance")
+    if settings.get("method") == "density" and resolution > 512:
+        raise ProjectError("density outlines require resolution at most 512")
     formats = settings.get("formats", ["svg"])
     if not isinstance(formats, list) or not formats or any(
             not isinstance(v, str) or v.lower() not in ("svg", "png", "pdf", "jpg")
@@ -716,40 +732,57 @@ def annotate(config: dict) -> list[Path]:
                   "width": str(width), "height": str(height),
                   "opacity": str(settings.get("background_opacity", 1))})
     labels = []
+    density = settings.get("method") == "density"
+    macro_sizes = set()
+    if density:
+        for size in _lef_sizes(lef_files, blocks_only=True).values():
+            macro_sizes.add(tuple(round(v, 6) for v in size))
+            macro_sizes.add(tuple(round(v, 6) for v in reversed(size)))
+    pixel_groups = []
+    density_seeds = []
+    # Keep seed grouping coarse when increasing the density boundary resolution.
+    seed_scale = min(scale, 140 / max(width, height)) if density else scale
+    seed_size = (max(1, round(width * seed_scale)), max(1, round(height * seed_scale)))
+    seed_area = round(settings.get("min_area_pixels", 50) * (seed_scale / scale)**2)
     with tempfile.TemporaryDirectory(prefix="outline-", dir=work) as temporary:
         for index, (pattern, spec) in enumerate(modules.items()):
-            boxes = [_pixel_box(box, canvas, resolution) for box in groups.get(pattern, ())]
-            boxes = [box for box in boxes if box is not None]
+            placed = [(box, pixels) for box in groups.get(pattern, ())
+                      if (pixels := _pixel_box(box, canvas, resolution)) is not None]
+            boxes = [pixels for _, pixels in placed]
+            if density:
+                pixel_groups.append([(pixels, tuple(round(v, 6) for v in
+                                     (box[2] - box[0], box[3] - box[1])) in macro_sizes)
+                                     for box, pixels in placed])
             if not boxes:
                 continue
-            mask = Image.new("1", trace_size, 1)
+            mask = Image.new("1", seed_size, 1)
             draw = ImageDraw.Draw(mask)
             for x0, y0, x1, y1 in boxes:
                 # Unknown standard-cell sizes are represented by a pixel at placement.
-                draw.rectangle((math.floor(x0 * scale), math.floor(y0 * scale),
-                                max(math.floor(x0 * scale), math.ceil(x1 * scale) - 1),
-                                max(math.floor(y0 * scale), math.ceil(y1 * scale) - 1)), fill=0)
+                draw.rectangle((math.floor(x0 * seed_scale), math.floor(y0 * seed_scale),
+                                max(math.floor(x0 * seed_scale), math.ceil(x1 * seed_scale) - 1),
+                                max(math.floor(y0 * seed_scale), math.ceil(y1 * seed_scale) - 1)), fill=0)
             trace_path = Path(temporary) / f"module-{index:04d}"
-            traced = _trace(mask, trace_path,
-                            settings.get("min_area_pixels", 50))
-            viewbox = [float(v) for v in traced.attrib["viewBox"].split()]
-            outer = ET.SubElement(root, f"{{{SVG}}}g", {
-                "transform": f"scale({width / viewbox[2]} {height / viewbox[3]})",
-                "fill": "none", "stroke": spec["color"],
-                "stroke-width": str(settings.get("stroke_width", 1)),
-            })
-            for child in traced:
-                if child.tag == f"{{{SVG}}}g":
-                    outer.append(child)
-            _style_paths(outer, spec["color"], float(settings.get("stroke_width", 1)),
-                         settings.get("stroke_border_width", 0),
-                         settings.get("stroke_border_color", "#000000"))
-            if traced.find(f".//{{{SVG}}}path") is not None and float(settings.get("font_size", 14)):
+            traced = _trace(mask, trace_path, seed_area)
+            if not density:
+                viewbox = [float(v) for v in traced.attrib["viewBox"].split()]
+                outer = ET.SubElement(root, f"{{{SVG}}}g", {
+                    "transform": f"scale({width / viewbox[2]} {height / viewbox[3]})",
+                    "fill": "none", "stroke": spec["color"],
+                    "stroke-width": str(settings.get("stroke_width", 1)),
+                })
+                for child in traced:
+                    if child.tag == f"{{{SVG}}}g":
+                        outer.append(child)
+                _style_paths(outer, spec["color"], float(settings.get("stroke_width", 1)),
+                             settings.get("stroke_border_width", 0),
+                             settings.get("stroke_border_color", "#000000"))
+            if traced.find(f".//{{{SVG}}}path") is not None and (density or float(settings.get("font_size", 14))):
                 filled = None
                 if settings.get("avoid_label_overlap", False):
                     raster = trace_path.with_suffix(".pgm")
                     if not raster.is_file():
-                        raster = _trace_raster(mask, trace_path, settings.get("min_area_pixels", 50))
+                        raster = _trace_raster(mask, trace_path, seed_area)
                     with _pixel_limit(mask.width * mask.height * 16):
                         with Image.open(raster) as source:
                             filled = source.convert("L")
@@ -757,17 +790,24 @@ def annotate(config: dict) -> list[Path]:
                     anchors = [(ax * mask.width / filled.width, ay * mask.height / filled.height)
                                for ax, ay in _region_anchors(filled)]
                 else:
-                    anchors = _trace_anchors(mask, trace_path, settings.get("min_area_pixels", 50))
+                    anchors = _trace_anchors(mask, trace_path, seed_area)
                 try:
                     for ax, ay in anchors:
                         x, y = ax * width / mask.width, ay * height / mask.height
-                        component = (_anchor_component(filled, x, y, width, height)
-                                     if filled is not None else None)
-                        labels.append((spec, x, y, component))
+                        if density:
+                            density_seeds.append((index + 1, x, y))
+                        else:
+                            component = (_anchor_component(filled, x, y, width, height)
+                                         if filled is not None else None)
+                            labels.append((spec, x, y, component))
                 finally:
                     if filled is not None:
                         filled.close()
             mask.close()
+        if density:
+            from .outline_density import annotate_regions
+            labels = annotate_regions(root, pixel_groups, modules, resolution,
+                                      trace_size, density_seeds, settings)
         for index, (spec, x, y, _) in enumerate(labels):
             if float(settings.get("font_size", 14)):
                 border = settings.get("label_border_width", 0)
@@ -782,7 +822,7 @@ def annotate(config: dict) -> list[Path]:
                     "x": str(x), "y": str(y), "text-anchor": "middle",
                     "dominant-baseline": "middle", "font-family": "sans-serif",
                     "font-weight": settings.get("font_weight", "normal"),
-                    "font-size": str(settings.get("font_size", 14)),
+                    "font-size": str(spec["font_size"] if density else settings.get("font_size", 14)),
                     "fill": settings.get("label_color") or _label_color(
                         spec["color"], float(settings.get("label_lightness", .85))),
                 })
