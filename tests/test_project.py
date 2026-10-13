@@ -185,20 +185,12 @@ lef_files = ["../lef/*.lef"]
             self.assertEqual(manifest["layout"]["routing_present"], ["Metal1"])
             self.assertEqual(manifest["layout"]["top_metal"], "TopMetal1")
 
-    def test_bundled_ihp_routing_stacks(self):
-        root = Path(__file__).resolve().parents[3]
-        cases = [
-            (root / "ihp13/sg13cmos5l/libs.tech/klayout/tech/sg13cmos5l.lyt",
-             "TopMetal1"),
-            (root / "ihp13/sg13g2/ihp-sg13g2/libs.tech/klayout/tech/sg13g2.lyt",
-             "TopMetal2"),
-        ]
-        for technology, terminal in cases:
-            if not technology.is_file():
-                self.skipTest("IHP technology checkout is not present")
-            resolved = resolve(technology)
-            self.assertEqual(resolved["top_metal"], terminal)
-            self.assertIn("Metal1", resolved["routing"])
+    def test_terminal_routing_layer_from_connectivity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            technology = Path(directory) / "tech.lyt"
+            for terminal in ("TopMetal1", "TopMetal2"):
+                technology.write_text(TECH.replace("TopMetal1", terminal))
+                self.assertEqual(resolve(technology)["top_metal"], terminal)
 
     def test_layer_alias_and_help(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".lyt") as stream:
