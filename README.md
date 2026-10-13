@@ -247,7 +247,13 @@ i_core = { label = "Core", color = "#fb120d" }
 
 Module keys select instance groups. `resolution` limits the raster used to
 trace outlines: a coarse grid groups nearby cells into module regions.
-The default is 200. Higher values take more time and memory.
+Use `method = "density"` for rounded, non-overlapping regions with shared
+borders. `smoothing_px = 12` controls grouping in output-image pixels;
+`fill_opacity = 0.2` adds a light module-color fill. This mode requires
+`resolution` at most 512. The default `method = "placement"` traces each
+module independently.
+Density labels vary with region area by up to 15% around `font_size`.
+The default resolution is 200. Higher values take more time and memory.
 
 `offset_um` is a `[dx, dy]` pair in microns, defaulting to `[0, 0]`; use it
 when the GDS was translated relative to the DEF. Positive `dx` shifts right
@@ -322,6 +328,7 @@ KLayout stages need KLayout with Python support; logo merge also needs Pillow.
 Host stages need Python 3.11+ and Pillow 9.1+. SVG artwork and annotation PNG/PDF
 exports need Inkscape; module outlines need potrace. PDF output needs img2pdf;
 posters also need pikepdf (installed with img2pdf).
+Density outlines also need NumPy, SciPy and Shapely 2+.
 Map viewers load Leaflet from its public CDN.
 
 `bin/artistic` uses `PYTHON` when set, otherwise the active `python3` (including

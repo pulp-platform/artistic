@@ -69,6 +69,41 @@ END MACRO
 
 
 class OutlineTests(unittest.TestCase):
+    def test_density_option_validation(self):
+        settings = self.config["render"]["outlines"]
+        for name, values in {
+            "method": ["graphcut", None, 1],
+            "fill_opacity": [-1, 1.01, True, "0.2", float("nan"), 10**1000],
+            "smoothing_px": [0, -1, True, "12", float("inf"), 10**1000],
+        }.items():
+            for value in values:
+                with self.subTest(name=name, value=value):
+                    settings[name] = value
+                    with self.assertRaises(ProjectError):
+                        _options(self.config)
+            settings.pop(name)
+        settings.update(method="density", fill_opacity=.2, smoothing_px=12)
+        _options(self.config)
+        settings["resolution"] = 513
+        with self.assertRaises(ProjectError):
+            _options(self.config)
+
+    @unittest.skipUnless(shutil.which("inkscape") and shutil.which("potrace"), "needs Inkscape and potrace")
+    def test_density_annotate_exports_svg_and_raster_smoke(self):
+        self._render_receipt()
+        settings = self.config["render"]["outlines"]
+        settings.update(method="density", fill_opacity=.2, smoothing_px=4,
+                        stroke_width=3.2, stroke_border_width=1.6,
+                        formats=["svg", "png"], font_size=10)
+        settings["modules"]["gen_sram_bank"] = {"label": "SRAM", "color": "#39729f"}
+        paths = annotate(self.config)
+        with Image.open(paths[1]) as image:
+            self.assertGreater(len(image.convert("RGB").getcolors(100000) or []), 2)
+        root = ET.parse(paths[0]).getroot()
+        texts = root.findall("{http://www.w3.org/2000/svg}text")
+        self.assertTrue(all(8.5 <= float(text.get("font-size")) <= 11.5 for text in texts))
+        self.assertGreater(len({text.get("font-size") for text in texts}), 1)
+
     def test_contrast_option_validation(self):
         settings = self.config["render"]["outlines"]
         for name, values in {
@@ -492,7 +527,7 @@ class OutlineTests(unittest.TestCase):
     def test_annotate_svg_and_verified_background(self):
         self._render_receipt()
         self.config["render"]["outlines"]["modules"]["gen_sram_bank"] = {
-            "label": "SRAM", "color": "#39729f"}
+            "label": "SRAM", "color": "#39729f", "font_size": 99}
         output = annotate(self.config)
         self.assertEqual(output, [self.work / "chip_modules.svg"])
         root = ET.parse(output[0]).getroot()
@@ -504,6 +539,7 @@ class OutlineTests(unittest.TestCase):
             "{http://www.w3.org/1999/xlink}href"], "chip_render.png")
         self.assertEqual([node.text for node in root.findall("svg:text", ns)],
                          ["UART & DMA", "UART & DMA", "SRAM"])
+        self.assertTrue(all(node.get("font-size") == "14" for node in root.findall("svg:text", ns)))
         self.assertTrue(root.findall(".//svg:path", ns))
         self.assertFalse(list(self.work.glob("outline-*")))
 
